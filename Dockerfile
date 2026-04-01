@@ -18,8 +18,16 @@ RUN apt-get update && apt-get upgrade -y && \
     libpixman-1-dev \
     zlib1g-dev \
     qemu-user \
-    qemu-user-static
+    qemu-user-static \
+    ffmpeg   # ✅ REQUIRED for animation export
 
+# ✅ Python dependencies
+RUN pip3 install --no-cache-dir \
+    numpy \
+    pandas \
+    matplotlib
+
+# Build QEMU with plugins
 RUN git clone https://gitlab.com/qemu-project/qemu.git /tmp/qemu && \
     cd /tmp/qemu && \
     git checkout stable-8.2 && \
@@ -32,5 +40,6 @@ RUN git clone https://gitlab.com/qemu-project/qemu.git /tmp/qemu && \
     rm -rf /tmp/qemu
 
 ENV PATH="/usr/local/bin:${PATH}"
+
 WORKDIR /workspace
 CMD ["/bin/bash"]
