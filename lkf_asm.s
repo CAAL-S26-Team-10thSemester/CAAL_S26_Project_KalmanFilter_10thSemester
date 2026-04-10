@@ -1,1434 +1,868 @@
 # =============================================================================
-# lkf_asm.s  --  Linear Kalman Filter  (RISC-V RV64GD scalar assembly)
+#  lkf_asm.s  —  RISC-V Scalar Assembly: Linear Kalman Filter
+#  Kalman Filter Milestone-3
 # =============================================================================
 #
-# Mirrors kalman-updated.py §§ LKF class exactly:
+#  Implements the LKF class from kalman-updated.py exactly:
 #
-#   State layout per joint j  (base offset = j*12 doubles):
-#       [px, vx, ax, jx,  py, vy, ay, jy,  pz, vz, az, jz]
+#    lkf_init          (dt)                    — __init__
+#    lkf_set_initial_state (lkf, joint, pos)   — set_initial_state
+#    lkf_predict       (lkf)                   — predict
+#    lkf_update        (lkf, z_flat)           — update
+#    lkf_get_positions (lkf, pos_out)          — get_positions
+#    lkf_get_full_state(lkf, out)              — get_full_state
 #
-#   Global matrices:
-#       F  : 276×276  block-diagonal constant-jerk state transition
-#       Q  : 276×276  block-diagonal process noise
-#       H  :  69×276  block-diagonal Cartesian measurement extractor
-#       R  :  69× 69  block-diagonal Cartesian measurement noise
-#       S  :  69× 69  innovation covariance  (scratch, per step)
-#       K  : 276× 69  Kalman gain            (scratch, per step)
+#  Also exposes the matrix-init helpers used only at startup:
+#    state_init_F      (F, dt)
+#    state_init_Q      (Q)
+#    meas_init_H       (H)
+#    meas_init_R       (R)
 #
-#   Per-frame algorithm:
-#       Predict:
-#           x      = F * x
-#           P      = F * P * F^T + Q
-#       Update:
-#           y      = z  - H*x           (69-D Cartesian innovation)
-#           PHt    = P  * H^T           (276×69)
-#           S      = H  * PHt + R       (69×69)
-#           S^{-1} via LU partial pivot
-#           K      = PHt * S^{-1}       (276×69)
-#           x      = x + K*y
-#           P      = (I-K*H)*P*(I-K*H)^T + K*R*K^T   (Joseph form)
-#
-# Public entry points (C ABI, a0-a7 for first 8 args, stack for rest):
-#
-#   lkf_init_F(double *F, double dt)
-#   lkf_init_Q(double *Q)
-#   lkf_init_H(double *H)
-#   lkf_init_R_cart(double *R)
-#   lkf_init_state(double *x, int joint, double px, double py, double pz)
-#   lkf_predict(double *x, double *P, const double *F, const double *Q,
-#               int N, double *tmp276, double *tmpNN)
-#   lkf_update(double *x, double *P,
-#              const double *H, const double *R_cart,
-#              const double *meas_cart,
-#              double *K_buf, double *S_buf,
-#              double *PHt_buf, double *y_buf,
-#              double *IKH_buf,
-#              int N_joints, int *pivot_buf)
-#   lkf_lu_inverse(double *A, double *Ainv, int n, int *pivot)
-#       Returns 0 (OK) or -1 (singular).
+#  All matrix operations delegate to matrix_asm.s via .extern / call.
 #
 # =============================================================================
-# ABI / register conventions
-# =============================================================================
-# Caller-saved: a0-a7, fa0-fa7, t0-t6, ft0-ft11
-# Callee-saved: s0-s11, fs0-fs11, ra, sp
-# All matrices ROW-MAJOR.  Element (i,j) of M×N matrix at base p:
-#   byte address = p + (i*N + j)*8
+#  LKF STATE STRUCT  (C layout, all fields 8-byte aligned)
+#  The struct is heap-allocated by the caller (C driver or lkf runner).
+#
+#  Offset  Size    Field
+#  ------  ------  -------
+#       0     8    dt          (double)
+#       8  2208    x[276]      (double[TOTAL_STATE_DIM])   state vector
+#    2216  609408  P[276×276]  (double[276*276])            covariance
+#  611624  609408  F[276×276]  (double[276*276])            state transition
+# 1221032  609408  Q[276×276]  (double[276*276])            process noise
+# 1830440  152208  H[69×276]   (double[69*276])             measurement
+# 1982648   38088  R[69×69]    (double[69*69])              meas noise
+# 2020736  (end)
+#
+#  Scratch buffers appended after struct (caller allocates total):
+# 2020736  152208  PHt[276×69]  temp for P@H^T
+# 2172944   38088  S[69×69]     innovation covariance
+# 2211032   38088  Sinv[69×69]  S inverse
+# 2249120     552  y[69]        innovation vector
+# 2249672  609408  Pjoseph_scratch[4*276*276]  Joseph update scratch
+# (total ≈ 5.0 MB per LKF instance)
+#
+#  Constants (matching kalman-updated.py exactly):
 # =============================================================================
 
     .section .rodata
     .align 3
 
-# ---------------------------------------------------------------------------
-# Double-precision constants
-# ---------------------------------------------------------------------------
-.lkf_const_one:
-    .double  1.0
-.lkf_const_half:
-    .double  0.5
-.lkf_const_sixth:
-    .double  0.16666666666666666667
-.lkf_const_eps:
-    .double  1.0e-10
+# --- Dimensions ---------------------------------------------------------------
+lkf_NUM_JOINTS:    .quad  23
+lkf_STATE_DIM:     .quad  12
+lkf_MEAS_DIM:      .quad   3
+lkf_N:             .quad  276    # TOTAL_STATE_DIM
+lkf_M:             .quad   69    # TOTAL_MEAS_DIM
 
-# Cartesian measurement noise (EST_R_PX, EST_R_PY, EST_R_PZ from Python)
-.lkf_r_cart:
-    .double  0.29472279   # sigma2_px
-    .double  0.09632091   # sigma2_py
-    .double  0.00204269   # sigma2_pz
+# --- Noise constants (match kalman-updated.py exactly) -----------------------
+lkf_EST_R_PX:      .double  0.29472279
+lkf_EST_R_PY:      .double  0.09632091
+lkf_EST_R_PZ:      .double  0.00204269
 
-# Process noise per state index mod 4
-.lkf_q_noise:
-    .double  1.0e-6   # index 0 : position
-    .double  1.0e-5   # index 1 : velocity
-    .double  1.0e-4   # index 2 : acceleration
-    .double  1.0e-4   # index 3 : jerk
+# --- Noise map: noise_map = {0:1e-6, 1:1e-5, 2:1e-4, 3:1e-4} ---------------
+lkf_noise_0:       .double  1e-6
+lkf_noise_1:       .double  1e-5
+lkf_noise_2:       .double  1e-4
+lkf_noise_3:       .double  1e-4
+
+# --- FP helpers ---------------------------------------------------------------
+lkf_fp_zero:       .double  0.0
+lkf_fp_one:        .double  1.0
+lkf_fp_half:       .double  0.5
+lkf_fp_sixth:      .double  0.16666666666666666667   # 1/6
+
+# --- Struct byte offsets (must match the layout table above) -----------------
+#  dt   = 0
+#  x    = 8                          (276 * 8 = 2208 bytes)
+#  P    = 8  + 2208  = 2216          (276*276*8 = 609408 bytes)
+#  F    = 2216 + 609408 = 611624
+#  Q    = 611624 + 609408 = 1221032
+#  H    = 1221032 + 609408 = 1830440  (69*276*8 = 152208 bytes)
+#  R    = 1830440 + 152208 = 1982648  (69*69*8 = 38088 bytes)
+# Scratch (appended, caller allocates):
+#  PHt  = 1982648 + 38088 = 2020736  (276*69*8 = 152208 bytes)
+#  S    = 2020736 + 152208 = 2172944 (69*69*8 = 38088 bytes)
+#  Sinv = 2172944 + 38088 = 2211032
+#  y    = 2211032 + 38088 = 2249120  (69*8 = 552 bytes)
+#  piv  = 2249120 + 552   = 2249672  (69*4 = 276 bytes, int32)
+#  joseph_scratch = 2249672+280 rounded to 8 = 2249952  (4*276*276*8 bytes)
+
+lkf_OFF_dt:        .quad       0
+lkf_OFF_x:         .quad       8
+lkf_OFF_P:         .quad    2216
+lkf_OFF_F:         .quad  611624
+lkf_OFF_Q:         .quad 1221032
+lkf_OFF_H:         .quad 1830440
+lkf_OFF_R:         .quad 1982792
+lkf_OFF_PHt:       .quad 2020880
+lkf_OFF_S:         .quad 2173232
+lkf_OFF_Sinv:      .quad 2211320
+lkf_OFF_y:         .quad 2249408
+lkf_OFF_piv:       .quad 2249960
+lkf_OFF_jscratch:  .quad 2250240   # 4*276*276*8 = 2437632 bytes
+lkf_TOTAL_BYTES:   .quad 4687872   # total allocation needed
 
     .section .text
-    .align 2
+
+# Declare all matrix_asm.s functions used here
+    .extern mat_eye
+    .extern mat_mul
+    .extern mat_add
+    .extern mat_sub
+    .extern mat_transpose
+    .extern mat_vec_mul
+    .extern mat_inverse_nxn
+    .extern mat_joseph_update
 
 # =============================================================================
-# lkf_zero_matrix -- Zero N doubles starting at ptr a0
-# =============================================================================
-# Args: a0 = double *ptr,  a1 = int count
-# Internal helper (not exported).
-# =============================================================================
-lkf_zero_matrix:
-    fcvt.d.w ft0, zero
-.lzm_loop:
-    beq     a1, zero, .lzm_done
-    fsd     ft0, 0(a0)
-    addi    a0, a0, 8
-    addi    a1, a1, -1
-    j       .lzm_loop
-.lzm_done:
-    ret
-
-# =============================================================================
-# lkf_init_F -- Build 276×276 block-diagonal state transition matrix F
-# =============================================================================
-# Args:
-#   a0 = double *F   (caller-alloc 276*276*8 bytes)
-#   fa0= double dt
+#  lkf_sizeof  —  return total byte size needed for one LKF instance
 #
-# F is identity with upper-triangle offsets inside each 4×4 sub-block:
-#   F[r,   r+1] = dt
-#   F[r,   r+2] = dt^2/2
-#   F[r,   r+3] = dt^3/6
-#   F[r+1, r+2] = dt
-#   F[r+1, r+3] = dt^2/2
-#   F[r+2, r+3] = dt
-# 23 joints × 3 axes = 69 such sub-blocks.
+#  size_t lkf_sizeof(void)
+#  Returns: a0 = 4687584
 # =============================================================================
-    .globl lkf_init_F
-lkf_init_F:
-    addi    sp, sp, -64
-    sd      ra, 56(sp)
-    sd      s0,  0(sp)
-    sd      s1,  8(sp)
-    sd      s2, 16(sp)
-    fsd     fs0, 24(sp)
-    fsd     fs1, 32(sp)
-    fsd     fs2, 40(sp)
-    fsd     fs3, 48(sp)
+    .globl lkf_sizeof
+    .type  lkf_sizeof, @function
+lkf_sizeof:
+    la      t0, lkf_TOTAL_BYTES
+    ld      a0, 0(t0)
+    ret
+    .size lkf_sizeof, .-lkf_sizeof
 
-    mv      s0, a0                  # F base ptr
 
-    # Zero F
-    mv      a0, s0
-    li      a1, 76176               # 276*276
-    call    lkf_zero_matrix
+# =============================================================================
+#  lkf_field  —  internal macro-like helper: load field ptr into a reg
+#  Usage (inline in other functions):
+#    la t0, lkf_OFF_xxx ; ld t0, 0(t0) ; add <reg>, <lkf>, t0
+# =============================================================================
 
-    # Diagonal = 1.0
-    la      t0, .lkf_const_one
-    fld     fs0, 0(t0)              # fs0 = 1.0
-    li      t0, 0                   # i
-    li      t2, 277                 # diagonal stride element count
-    slli    t2, t2, 3               # 277*8 bytes
-    mv      t1, s0
-.lF_diag:
-    li      t3, 276
-    bge     t0, t3, .lF_diag_done
-    fsd     fs0, 0(t1)
-    add     t1, t1, t2
-    addi    t0, t0, 1
-    j       .lF_diag
-.lF_diag_done:
+# =============================================================================
+#  state_init_F  —  build F (276×276 block-diagonal state transition)
+#
+#  Python:
+#    F = eye(276)
+#    dt2 = 0.5 * dt * dt
+#    dt3 = (1/6) * dt^3
+#    for j in 0..22:
+#      base = j*12
+#      for axis in 0..2:
+#        r = base + axis*4
+#        F[r,r+1]=dt; F[r,r+2]=dt2; F[r,r+3]=dt3
+#        F[r+1,r+2]=dt; F[r+1,r+3]=dt2
+#        F[r+2,r+3]=dt
+#
+#  void state_init_F(double *F, double dt)
+#  a0=F, fa0=dt
+#
+#  Register map:
+#    s0=F  fs0=dt  fs1=dt2  fs2=dt3
+#    s1=j(joint)  s2=axis  s3=r  s4=N=276
+# =============================================================================
+    .globl state_init_F
+    .type  state_init_F, @function
+state_init_F:
+    addi    sp, sp, -56
+    sd      ra,  0(sp); sd s0,  8(sp); sd s1, 16(sp)
+    sd      s2, 24(sp); sd s3, 32(sp); sd s4, 40(sp)
+    fsd     fs0, 48(sp)
 
-    # Precompute dt powers into callee-saved FP regs
-    la      t0, .lkf_const_half
+    mv      s0, a0              # F base ptr
+    fmv.d   fs0, fa0            # dt
+
+    # F = eye(276)
+    li      a1, 276
+    call    mat_eye             # mat_eye(F, 276) — a0=s0 already set above
+    # (a0 was s0 before the call; mat_eye clobbers a0 — restore from s0)
+
+    # dt2 = 0.5 * dt * dt
+    la      t0, lkf_fp_half
     fld     ft0, 0(t0)
-    la      t0, .lkf_const_sixth
-    fld     ft1, 0(t0)
-    fmul.d  fs1, fa0, fa0           # fs1 = dt^2
-    fmul.d  fs2, fs1, ft0           # fs2 = dt^2/2
-    fmul.d  ft2, fs1, fa0           # ft2 = dt^3
-    fmul.d  fs3, ft2, ft1           # fs3 = dt^3/6
-    fmv.d   fs0, fa0                # fs0 = dt (overwrite 1.0; diagonal done)
+    fmul.d  fs1, fs0, fs0       # dt*dt
+    fmul.d  fs1, ft0, fs1       # 0.5 * dt^2
 
-    # 23 joints × 3 axes
-    li      s1, 0                   # joint
-    li      s2, 23
-.lF_jloop:
-    bge     s1, s2, .lF_jdone
-    li      t0, 0                   # axis
-.lF_aloop:
-    li      t3, 3
-    bge     t0, t3, .lF_adone
+    # dt3 = (1/6) * dt^3
+    la      t0, lkf_fp_sixth
+    fld     ft0, 0(t0)
+    fmul.d  fs2, fs1, fs0       # 0.5*dt^2 * dt  (= dt^3/2)
+    fadd.d  fs2, fs2, fs2       # dt^3
+    fmul.d  fs2, ft0, fs2       # (1/6)*dt^3
 
-    # r = joint*12 + axis*4
+    li      s4, 276             # N
+    li      s1, 0               # j = 0
+.LF_j:
+    li      t0, 23
+    bge     s1, t0, .LF_done
+
+    # base = j * 12
     li      t1, 12
-    mul     t1, s1, t1
-    slli    t2, t0, 2
-    add     t1, t1, t2              # t1 = r
+    mul     t2, s1, t1          # base = j*12
 
-    # &F[r][r]  = F + r*277*8
-    li      t3, 277
-    mul     t4, t1, t3
-    slli    t4, t4, 3
-    add     t4, s0, t4              # t4 = &F[r][r]
-
-    fsd     fs0,  8(t4)             # F[r,r+1]   = dt
-    fsd     fs2, 16(t4)             # F[r,r+2]   = dt2/2
-    fsd     fs3, 24(t4)             # F[r,r+3]   = dt3/6
-
-    # &F[r+1][r+1]
-    addi    t5, t1, 1
-    mul     t6, t5, t3
-    slli    t6, t6, 3
-    add     t6, s0, t6
-    fsd     fs0,  8(t6)             # F[r+1,r+2] = dt
-    fsd     fs2, 16(t6)             # F[r+1,r+3] = dt2/2
-
-    # &F[r+2][r+2]
-    addi    t5, t1, 2
-    mul     t6, t5, t3
-    slli    t6, t6, 3
-    add     t6, s0, t6
-    fsd     fs0,  8(t6)             # F[r+2,r+3] = dt
-
-    addi    t0, t0, 1
-    j       .lF_aloop
-.lF_adone:
-    addi    s1, s1, 1
-    j       .lF_jloop
-.lF_jdone:
-
-    fld     fs3, 48(sp)
-    fld     fs2, 40(sp)
-    fld     fs1, 32(sp)
-    fld     fs0, 24(sp)
-    ld      s2, 16(sp)
-    ld      s1,  8(sp)
-    ld      s0,  0(sp)
-    ld      ra, 56(sp)
-    addi    sp, sp, 64
-    ret
-
-# =============================================================================
-# lkf_init_Q -- Build 276×276 block-diagonal process noise matrix Q
-# =============================================================================
-# Args:  a0 = double *Q
-# Noise per state-index mod 4: {0:1e-6, 1:1e-5, 2:1e-4, 3:1e-4}
-# =============================================================================
-    .globl lkf_init_Q
-lkf_init_Q:
-    addi    sp, sp, -32
-    sd      ra, 24(sp)
-    sd      s0,  0(sp)
-    sd      s1,  8(sp)
-
-    mv      s0, a0
-
-    mv      a1, a0
-    li      a0, 76176 
-    # (a0 = Q, a1 = count): reuse zero helper signature
-    mv      a1, a0
-    mv      a0, s0
-    call    lkf_zero_matrix
-
-    la      t2, .lkf_q_noise
-    fld     ft1,  0(t2)             # 1e-6
-    fld     ft2,  8(t2)             # 1e-5
-    fld     ft3, 16(t2)             # 1e-4 (acc)
-    fld     ft4, 24(t2)             # 1e-4 (jerk)
-
-    li      s1, 0                   # i
-    li      t5, 276
-.lQ_loop:
-    bge     s1, t5, .lQ_done
-    li      t3, 277
-    mul     t4, s1, t3
-    slli    t4, t4, 3
-    add     t4, s0, t4              # &Q[i][i]
-
-    andi    t6, s1, 3               # i % 4
-    beq     t6, zero, .lQ_c0
-    li      t0, 1
-    beq     t6, t0,  .lQ_c1
-    li      t0, 2
-    beq     t6, t0,  .lQ_c2
-    fsd     ft4, 0(t4); j .lQ_next  # case 3: jerk
-.lQ_c0: fsd ft1, 0(t4); j .lQ_next
-.lQ_c1: fsd ft2, 0(t4); j .lQ_next
-.lQ_c2: fsd ft3, 0(t4)
-.lQ_next:
-    addi    s1, s1, 1
-    j       .lQ_loop
-.lQ_done:
-    ld      s1,  8(sp)
-    ld      s0,  0(sp)
-    ld      ra, 24(sp)
-    addi    sp, sp, 32
-    ret
-
-# Suppress register alias:
-a0_v = a0
-
-# =============================================================================
-# lkf_init_H -- Build 69×276 block-diagonal Cartesian measurement matrix H
-# =============================================================================
-# Args:  a0 = double *H   (caller-alloc 69*276*8 = 152064 bytes)
-#
-# For joint j (0..22):
-#   H[j*3+0, j*12+0] = 1.0   (px)
-#   H[j*3+1, j*12+4] = 1.0   (py)
-#   H[j*3+2, j*12+8] = 1.0   (pz)
-# =============================================================================
-    .globl lkf_init_H
-lkf_init_H:
-    addi    sp, sp, -32
-    sd      ra, 24(sp)
-    sd      s0,  0(sp)
-    sd      s1,  8(sp)
-
-    mv      s0, a0
-
-    # Zero H (69*276 = 19044 doubles)
-    li      a1, 19044
-    call    lkf_zero_matrix
-
-    la      t0, .lkf_const_one
-    fld     ft1, 0(t0)              # ft1 = 1.0
-
-    li      s1, 0                   # joint
-    li      t6, 23
-.lH_loop:
-    bge     s1, t6, .lH_done
-    # rb = j*3, cb = j*12
+    li      s2, 0               # axis = 0
+.LF_axis:
     li      t0, 3
-    mul     t0, s1, t0              # rb
-    li      t1, 12
-    mul     t1, s1, t1              # cb
+    bge     s2, t0, .LF_axis_done
 
-    # H[rb+0, cb+0]: element offset (rb*276 + cb)
-    li      t2, 276
-    mul     t3, t0, t2
-    add     t3, t3, t1
-    slli    t3, t3, 3
-    add     t3, s0, t3
-    fsd     ft1, 0(t3)              # H[rb,cb] = 1.0  (px row)
+    # r = base + axis*4
+    slli    t0, s2, 2
+    add     s3, t2, t0          # r = base + axis*4
 
-    # H[rb+1, cb+4]: ((rb+1)*276 + cb+4)*8
-    addi    t4, t0, 1               # rb+1
-    mul     t3, t4, t2
-    addi    t5, t1, 4               # cb+4
-    add     t3, t3, t5
-    slli    t3, t3, 3
-    add     t3, s0, t3
-    fsd     ft1, 0(t3)              # H[rb+1,cb+4] = 1.0  (py row)
+    # --- F[r, r+1] = dt  (offset = (r*276 + r+1)*8) ---
+    # helper: write ft to F[row][col]
+    # offset = (row * 276 + col) * 8
+    # F[r,r+1]
+    mul     t0, s3, s4; add t0, t0, s3; addi t0, t0, 1
+    slli    t0, t0, 3; add t0, s0, t0
+    fsd     fs0, 0(t0)
 
-    # H[rb+2, cb+8]: ((rb+2)*276 + cb+8)*8
-    addi    t4, t0, 2               # rb+2
-    mul     t3, t4, t2
-    addi    t5, t1, 8               # cb+8
-    add     t3, t3, t5
-    slli    t3, t3, 3
-    add     t3, s0, t3
-    fsd     ft1, 0(t3)              # H[rb+2,cb+8] = 1.0  (pz row)
+    # F[r, r+2] = dt2
+    mul     t0, s3, s4; add t0, t0, s3; addi t0, t0, 2
+    slli    t0, t0, 3; add t0, s0, t0
+    fsd     fs1, 0(t0)
 
-    addi    s1, s1, 1
-    j       .lH_loop
-.lH_done:
-    ld      s1,  8(sp)
-    ld      s0,  0(sp)
-    ld      ra, 24(sp)
-    addi    sp, sp, 32
-    ret
+    # F[r, r+3] = dt3
+    mul     t0, s3, s4; add t0, t0, s3; addi t0, t0, 3
+    slli    t0, t0, 3; add t0, s0, t0
+    fsd     fs2, 0(t0)
+
+    # F[r+1, r+2] = dt
+    addi    t1, s3, 1           # row = r+1
+    mul     t0, t1, s4; add t0, t0, s3; addi t0, t0, 2
+    slli    t0, t0, 3; add t0, s0, t0
+    fsd     fs0, 0(t0)
+
+    # F[r+1, r+3] = dt2
+    mul     t0, t1, s4; add t0, t0, s3; addi t0, t0, 3
+    slli    t0, t0, 3; add t0, s0, t0
+    fsd     fs1, 0(t0)
+
+    # F[r+2, r+3] = dt
+    addi    t1, s3, 2           # row = r+2
+    mul     t0, t1, s4; add t0, t0, s3; addi t0, t0, 3
+    slli    t0, t0, 3; add t0, s0, t0
+    fsd     fs0, 0(t0)
+
+    addi    s2, s2, 1; j .LF_axis
+.LF_axis_done:
+    addi    s1, s1, 1; j .LF_j
+.LF_done:
+    ld      ra,  0(sp); ld s0,  8(sp); ld s1, 16(sp)
+    ld      s2, 24(sp); ld s3, 32(sp); ld s4, 40(sp)
+    fld     fs0, 48(sp)
+    addi    sp, sp, 56; ret
+    .size state_init_F, .-state_init_F
+
 
 # =============================================================================
-# lkf_init_R_cart -- Build 69×69 Cartesian measurement noise matrix R
+#  state_init_Q  —  build Q (276×276 block-diagonal process noise)
+#
+#  Python:
+#    Q = zeros(276,276)
+#    noise_map = {0:1e-6, 1:1e-5, 2:1e-4, 3:1e-4}
+#    for j in 0..22:
+#      base = j*12
+#      for i in 0..11:
+#        Q[base+i, base+i] = noise_map[i % 4]
+#
+#  void state_init_Q(double *Q)
+#  a0=Q
 # =============================================================================
-# Args:  a0 = double *R   (caller-alloc 69*69*8 = 38088 bytes)
-# 23 identical 3×3 diagonal blocks: diag(0.29472279, 0.09632091, 0.00204269)
-# =============================================================================
-    .globl lkf_init_R_cart
-lkf_init_R_cart:
+    .globl state_init_Q
+    .type  state_init_Q, @function
+state_init_Q:
     addi    sp, sp, -32
-    sd      ra, 24(sp)
-    sd      s0,  0(sp)
-    sd      s1,  8(sp)
+    sd      ra, 0(sp); sd s0, 8(sp); sd s1, 16(sp); sd s2, 24(sp)
+
+    mv      s0, a0              # Q base
+
+    # zero Q: 276*276*8 bytes
+    li      t0, 276; mul t0, t0, t0; slli t0, t0, 3   # byte count
+    add     t1, s0, t0          # end ptr
+    la      t2, lkf_fp_zero; fld ft0, 0(t2)
+    mv      t2, s0
+.LQ_zero:
+    bge     t2, t1, .LQ_zero_done
+    fsd     ft0, 0(t2); addi t2, t2, 8; j .LQ_zero
+.LQ_zero_done:
+
+    # Load noise values
+    la      t0, lkf_noise_0; fld ft0, 0(t0)   # 1e-6
+    la      t0, lkf_noise_1; fld ft1, 0(t0)   # 1e-5
+    la      t0, lkf_noise_2; fld ft2, 0(t0)   # 1e-4 (also noise_3)
+
+    li      s1, 0               # j = 0
+.LQ_j:
+    li      t3, 23
+    bge     s1, t3, .LQ_done
+    li      t4, 12; mul t4, s1, t4   # base = j*12
+
+    li      s2, 0               # i = 0
+.LQ_i:
+    li      t3, 12
+    bge     s2, t3, .LQ_i_done
+
+    # Q[base+i, base+i] = noise_map[i%4]
+    add     t5, t4, s2          # row = col = base+i
+    li      t6, 276
+    mul     t0, t5, t6; add t0, t0, t5
+    slli    t0, t0, 3; add t0, s0, t0    # &Q[base+i][base+i]
+
+    # select noise based on i%4
+    andi    t3, s2, 3           # i % 4
+    beqz    t3, .LQ_n0
+    li      t6, 1; beq t3, t6, .LQ_n1
+    fsd     ft2, 0(t0)          # i%4 == 2 or 3: 1e-4
+    j       .LQ_next
+.LQ_n0: fsd ft0, 0(t0); j .LQ_next
+.LQ_n1: fsd ft1, 0(t0)
+.LQ_next:
+    addi    s2, s2, 1; j .LQ_i
+.LQ_i_done:
+    addi    s1, s1, 1; j .LQ_j
+.LQ_done:
+    ld      ra, 0(sp); ld s0, 8(sp); ld s1, 16(sp); ld s2, 24(sp)
+    addi    sp, sp, 32; ret
+    .size state_init_Q, .-state_init_Q
+
+
+# =============================================================================
+#  meas_init_H  —  build H (69×276 block-diagonal measurement matrix)
+#
+#  Python:
+#    H = zeros(69, 276)
+#    for j in 0..22:
+#      rb = j*3;  cb = j*12
+#      H[rb+0, cb+0] = 1.0   # px
+#      H[rb+1, cb+4] = 1.0   # py
+#      H[rb+2, cb+8] = 1.0   # pz
+#
+#  void meas_init_H(double *H)
+#  a0=H
+# =============================================================================
+    .globl meas_init_H
+    .type  meas_init_H, @function
+meas_init_H:
+    addi    sp, sp, -24
+    sd      ra, 0(sp); sd s0, 8(sp); sd s1, 16(sp)
 
     mv      s0, a0
 
-    # Zero R (69*69 = 4761 doubles)
-    li      a1, 4761
-    call    lkf_zero_matrix
+    # zero H: 69*276*8 bytes
+    li      t0, 69; li t1, 276; mul t0, t0, t1; slli t0, t0, 3
+    add     t1, s0, t0
+    la      t2, lkf_fp_zero; fld ft0, 0(t2)
+    mv      t2, s0
+.LH_zero:
+    bge     t2, t1, .LH_zero_done
+    fsd     ft0, 0(t2); addi t2, t2, 8; j .LH_zero
+.LH_zero_done:
 
-    la      t2, .lkf_r_cart
-    fld     ft1,  0(t2)             # EST_R_PX
-    fld     ft2,  8(t2)             # EST_R_PY
-    fld     ft3, 16(t2)             # EST_R_PZ
+    la      t0, lkf_fp_one; fld ft1, 0(t0)
+    li      s1, 0           # j = 0
+.LH_j:
+    li      t0, 23
+    bge     s1, t0, .LH_done
+
+    li      t1, 3;  mul t2, s1, t1   # rb = j*3
+    li      t1, 12; mul t3, s1, t1   # cb = j*12
+
+    # H[rb+0, cb+0] = 1.0:  offset = (rb*276 + cb)*8
+    li      t4, 276
+    mul     t0, t2, t4; add t0, t0, t3
+    slli    t0, t0, 3; add t0, s0, t0; fsd ft1, 0(t0)
+
+    # H[rb+1, cb+4] = 1.0
+    addi    t5, t2, 1
+    mul     t0, t5, t4; add t0, t0, t3; addi t0, t0, 4
+    slli    t0, t0, 3; add t0, s0, t0; fsd ft1, 0(t0)
+
+    # H[rb+2, cb+8] = 1.0
+    addi    t5, t2, 2
+    mul     t0, t5, t4; add t0, t0, t3; addi t0, t0, 8
+    slli    t0, t0, 3; add t0, s0, t0; fsd ft1, 0(t0)
+
+    addi    s1, s1, 1; j .LH_j
+.LH_done:
+    ld      ra, 0(sp); ld s0, 8(sp); ld s1, 16(sp)
+    addi    sp, sp, 24; ret
+    .size meas_init_H, .-meas_init_H
+
+
+# =============================================================================
+#  meas_init_R  —  build R (69×69 block-diagonal measurement noise)
+#
+#  Python:
+#    R = zeros(69,69)
+#    for j in 0..22:
+#      b = j*3
+#      R[b+0,b+0] = EST_R_PX (0.29472279)
+#      R[b+1,b+1] = EST_R_PY (0.09632091)
+#      R[b+2,b+2] = EST_R_PZ (0.00204269)
+#
+#  void meas_init_R(double *R)
+#  a0=R
+# =============================================================================
+    .globl meas_init_R
+    .type  meas_init_R, @function
+meas_init_R:
+    addi    sp, sp, -24
+    sd      ra, 0(sp); sd s0, 8(sp); sd s1, 16(sp)
+
+    mv      s0, a0
+
+    # zero R: 69*69*8 bytes
+    li      t0, 69; mul t0, t0, t0; slli t0, t0, 3
+    add     t1, s0, t0
+    la      t2, lkf_fp_zero; fld ft0, 0(t2)
+    mv      t2, s0
+.LR_zero:
+    bge     t2, t1, .LR_zero_done
+    fsd     ft0, 0(t2); addi t2, t2, 8; j .LR_zero
+.LR_zero_done:
+
+    la      t0, lkf_EST_R_PX; fld ft0, 0(t0)
+    la      t0, lkf_EST_R_PY; fld ft1, 0(t0)
+    la      t0, lkf_EST_R_PZ; fld ft2, 0(t0)
 
     li      s1, 0
-    li      t6, 23
-.lR_loop:
-    bge     s1, t6, .lR_done
-    li      t0, 3
-    mul     t0, s1, t0              # rb = j*3
+.LR_j:
+    li      t3, 23
+    bge     s1, t3, .LR_done
+    li      t4, 3; mul t4, s1, t4    # b = j*3
 
-    # diagonal element stride for 69×69 matrix = 70*8 bytes
-    li      t3, 70
+    li      t5, 69
+    # R[b+0,b+0]
+    mul     t0, t4, t5; add t0, t0, t4
+    slli    t0, t0, 3; add t0, s0, t0; fsd ft0, 0(t0)
+    # R[b+1,b+1]
+    addi    t6, t4, 1
+    mul     t0, t6, t5; add t0, t0, t6
+    slli    t0, t0, 3; add t0, s0, t0; fsd ft1, 0(t0)
+    # R[b+2,b+2]
+    addi    t6, t4, 2
+    mul     t0, t6, t5; add t0, t0, t6
+    slli    t0, t0, 3; add t0, s0, t0; fsd ft2, 0(t0)
 
-    # R[rb+0][rb+0]
-    mul     t4, t0, t3
-    slli    t4, t4, 3
-    add     t4, s0, t4
-    fsd     ft1, 0(t4)
+    addi    s1, s1, 1; j .LR_j
+.LR_done:
+    ld      ra, 0(sp); ld s0, 8(sp); ld s1, 16(sp)
+    addi    sp, sp, 24; ret
+    .size meas_init_R, .-meas_init_R
 
-    # R[rb+1][rb+1]
-    addi    t5, t0, 1
-    mul     t4, t5, t3
-    slli    t4, t4, 3
-    add     t4, s0, t4
-    fsd     ft2, 0(t4)
-
-    # R[rb+2][rb+2]
-    addi    t5, t0, 2
-    mul     t4, t5, t3
-    slli    t4, t4, 3
-    add     t4, s0, t4
-    fsd     ft3, 0(t4)
-
-    addi    s1, s1, 1
-    j       .lR_loop
-.lR_done:
-    ld      s1,  8(sp)
-    ld      s0,  0(sp)
-    ld      ra, 24(sp)
-    addi    sp, sp, 32
-    ret
 
 # =============================================================================
-# lkf_init_state -- Initialise joint j sub-state in x vector
-# =============================================================================
-# Args:
-#   a0 = double *x
-#   a1 = int joint
-#   fa0= double px
-#   fa1= double py
-#   fa2= double pz
-# =============================================================================
-    .globl lkf_init_state
-lkf_init_state:
-    li      t0, 96
-    mul     t0, a1, t0              # t0 = joint*12*8
-    add     t0, a0, t0              # t0 = &x[joint*12]
-
-    fcvt.d.w ft0, zero
-    fsd     ft0,  0(t0)
-    fsd     ft0,  8(t0)
-    fsd     ft0, 16(t0)
-    fsd     ft0, 24(t0)
-    fsd     ft0, 32(t0)
-    fsd     ft0, 40(t0)
-    fsd     ft0, 48(t0)
-    fsd     ft0, 56(t0)
-    fsd     ft0, 64(t0)
-    fsd     ft0, 72(t0)
-    fsd     ft0, 80(t0)
-    fsd     ft0, 88(t0)
-
-    fsd     fa0,  0(t0)             # x[b+0]  = px
-    fsd     fa1, 32(t0)             # x[b+4]  = py  (4*8=32)
-    fsd     fa2, 64(t0)             # x[b+8]  = pz  (8*8=64)
-    ret
-
-# =============================================================================
-# lkf_predict -- LKF prediction step
-# =============================================================================
-# Args:
-#   a0 = double *x         (276-D, in/out)
-#   a1 = double *P         (276×276, in/out)
-#   a2 = const double *F   (276×276)
-#   a3 = const double *Q   (276×276)
-#   a4 = int N             (= 276)
-#   a5 = double *tmp276    (276-double scratch)
-#   a6 = double *tmpNN     (276×276-double scratch for F*P)
+#  lkf_init  —  initialise all fields of an LKF struct
 #
-# x = F*x  (matrix-vector)
-# P = F*P*F^T + Q  (two matrix-matrix multiplies + element-wise add)
-# fmadd.d used throughout.
+#  Python __init__:
+#    self.dt = dt
+#    self.x  = zeros(276)
+#    self.P  = eye(276)
+#    self.F  = state_init_F(dt)
+#    self.Q  = state_init_Q()
+#    self.H  = meas_init_H()
+#    self.R  = meas_init_R()
+#
+#  void lkf_init(void *lkf, double dt)
+#  a0=lkf ptr, fa0=dt
+#
+#  Register map:  s0=lkf
+# =============================================================================
+    .globl lkf_init
+    .type  lkf_init, @function
+lkf_init:
+    addi    sp, sp, -24
+    sd      ra, 0(sp); sd s0, 8(sp)
+    fsd     fs0, 16(sp)
+
+    mv      s0, a0
+    fmv.d   fs0, fa0            # save dt
+
+    # store dt at offset 0
+    fsd     fs0, 0(s0)
+
+    # x = zeros(276): offset 8, 276*8=2208 bytes
+    la      t0, lkf_fp_zero; fld ft0, 0(t0)
+    addi    t1, s0, 8           # &x[0]
+    li      t2, 276; slli t2, t2, 3; add t2, t1, t2
+.Linit_xz:
+    bge     t1, t2, .Linit_xz_done
+    fsd     ft0, 0(t1); addi t1, t1, 8; j .Linit_xz
+.Linit_xz_done:
+
+    # P = eye(276): offset 2216
+    la      t0, lkf_OFF_P; ld t0, 0(t0)
+    add     a0, s0, t0          # &P
+    li      a1, 276
+    call    mat_eye
+
+    # F = state_init_F(dt): offset 611624
+    la      t0, lkf_OFF_F; ld t0, 0(t0)
+    add     a0, s0, t0          # &F
+    fmv.d   fa0, fs0            # dt
+    call    state_init_F
+
+    # Q = state_init_Q(): offset 1221032
+    la      t0, lkf_OFF_Q; ld t0, 0(t0)
+    add     a0, s0, t0
+    call    state_init_Q
+
+    # H = meas_init_H(): offset 1830440
+    la      t0, lkf_OFF_H; ld t0, 0(t0)
+    add     a0, s0, t0
+    call    meas_init_H
+
+    # R = meas_init_R(): offset 1982648
+    la      t0, lkf_OFF_R; ld t0, 0(t0)
+    add     a0, s0, t0
+    call    meas_init_R
+
+    ld      ra, 0(sp); ld s0, 8(sp); fld fs0, 16(sp)
+    addi    sp, sp, 24; ret
+    .size lkf_init, .-lkf_init
+
+
+# =============================================================================
+#  lkf_set_initial_state  —  set sub-state for one joint from position vector
+#
+#  Python:
+#    b = joint_idx * 12
+#    x[b+0]=pos[0]; x[b+1]=0; x[b+2]=0; x[b+3]=0
+#    x[b+4]=pos[1]; x[b+5]=0; x[b+6]=0; x[b+7]=0
+#    x[b+8]=pos[2]; x[b+9]=0; x[b+10]=0;x[b+11]=0
+#
+#  void lkf_set_initial_state(void *lkf, int joint_idx, double *pos3)
+#  a0=lkf, a1=joint_idx, a2=pos3 (ptr to double[3])
+# =============================================================================
+    .globl lkf_set_initial_state
+    .type  lkf_set_initial_state, @function
+lkf_set_initial_state:
+    # compute &x[b]:  lkf + OFF_x + joint*12*8
+    la      t0, lkf_OFF_x; ld t0, 0(t0)
+    add     t0, a0, t0          # &x[0]
+    li      t1, 12; mul t1, a1, t1; slli t1, t1, 3
+    add     t0, t0, t1          # &x[b]
+
+    la      t1, lkf_fp_zero; fld ft0, 0(t1)
+
+    # load pos[0], pos[1], pos[2]
+    fld     ft1, 0(a2)          # pos[0]
+    fld     ft2, 8(a2)          # pos[1]
+    fld     ft3,16(a2)          # pos[2]
+
+    fsd     ft1,  0(t0)         # x[b+0]  = pos[0]
+    fsd     ft0,  8(t0)         # x[b+1]  = 0
+    fsd     ft0, 16(t0)         # x[b+2]  = 0
+    fsd     ft0, 24(t0)         # x[b+3]  = 0
+    fsd     ft2, 32(t0)         # x[b+4]  = pos[1]
+    fsd     ft0, 40(t0)         # x[b+5]  = 0
+    fsd     ft0, 48(t0)         # x[b+6]  = 0
+    fsd     ft0, 56(t0)         # x[b+7]  = 0
+    fsd     ft3, 64(t0)         # x[b+8]  = pos[2]
+    fsd     ft0, 72(t0)         # x[b+9]  = 0
+    fsd     ft0, 80(t0)         # x[b+10] = 0
+    fsd     ft0, 88(t0)         # x[b+11] = 0
+    ret
+    .size lkf_set_initial_state, .-lkf_set_initial_state
+
+
+# =============================================================================
+#  lkf_predict  —  prediction step
+#
+#  Python:
+#    self.x = F @ x                     (state_predict_x)
+#    self.P = F @ P @ F.T + Q           (state_predict_P)
+#
+#  Implementation:
+#    x_new = mat_mul(F, x, 276, 276, 1)  [mat_vec_mul]
+#    Ftmp  = mat_mul(F, P, 276, 276, 276)
+#    P_new = mat_mul(Ftmp, F^T, 276, 276, 276) + Q
+#
+#  Scratch used:  PHt field reused as Ftmp (276×276 = 609408 bytes)
+#                 Note: PHt is 276×69 which is SMALLER than 276×276.
+#                 We use the joseph_scratch area (4*276*276) as Ftmp.
+#
+#  void lkf_predict(void *lkf)
+#  a0=lkf
+#
+#  Register map:  s0=lkf  s1=&x  s2=&P  s3=&F  s4=&Q  s5=&jscratch(Ftmp)  s6=&FT
 # =============================================================================
     .globl lkf_predict
+    .type  lkf_predict, @function
 lkf_predict:
-    addi    sp, sp, -80
-    sd      ra, 72(sp)
-    sd      s0,  0(sp)
-    sd      s1,  8(sp)
-    sd      s2, 16(sp)
-    sd      s3, 24(sp)
-    sd      s4, 32(sp)
-    sd      s5, 40(sp)
-    sd      s6, 48(sp)
-    sd      s7, 56(sp)
+    addi    sp, sp, -64
+    sd      ra,  0(sp); sd s0,  8(sp); sd s1, 16(sp)
+    sd      s2, 24(sp); sd s3, 32(sp); sd s4, 40(sp)
+    sd      s5, 48(sp); sd s6, 56(sp)
 
-    mv      s0, a0                  # x
-    mv      s1, a1                  # P
-    mv      s2, a2                  # F
-    mv      s3, a3                  # Q
-    mv      s4, a4                  # N = 276
-    mv      s5, a5                  # tmp276
-    mv      s6, a6                  # tmpNN  (F*P scratch)
+    mv      s0, a0
 
-    # ---- Step 1: tmp276 = F * x ----
-    li      s7, 0                   # i
-.lp_Fx_i:
-    bge     s7, s4, .lp_Fx_done
-    fcvt.d.w ft0, zero
-    li      t5, 0                   # k
-    # &F[i][0] = s2 + i*276*8
-    mul     t0, s7, s4
-    slli    t0, t0, 3
-    add     t0, s2, t0
-    mv      t1, s0                  # &x[0]
-.lp_Fx_k:
-    bge     t5, s4, .lp_Fx_kd
-    fld     ft1, 0(t0)
-    fld     ft2, 0(t1)
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t0, t0, 8
-    addi    t1, t1, 8
-    addi    t5, t5, 1
-    j       .lp_Fx_k
-.lp_Fx_kd:
-    slli    t0, s7, 3
-    add     t0, s5, t0
-    fsd     ft0, 0(t0)              # tmp276[i]
-    addi    s7, s7, 1
-    j       .lp_Fx_i
-.lp_Fx_done:
+    # load field pointers
+    la      t0, lkf_OFF_x;  ld t0, 0(t0); add s1, s0, t0   # &x
+    la      t0, lkf_OFF_P;  ld t0, 0(t0); add s2, s0, t0   # &P
+    la      t0, lkf_OFF_F;  ld t0, 0(t0); add s3, s0, t0   # &F
+    la      t0, lkf_OFF_Q;  ld t0, 0(t0); add s4, s0, t0   # &Q
+    # Ftmp = jscratch[0..276*276-1], FT = jscratch[276*276..2*276*276-1]
+    la      t0, lkf_OFF_jscratch; ld t0, 0(t0); add s5, s0, t0  # Ftmp
+    li      t1, 276; mul t1, t1, t1; slli t1, t1, 3
+    add     s6, s5, t1          # FT = Ftmp + 276*276*8
 
-    # Copy tmp276 -> x
-    li      t0, 0
-.lp_cpx:
-    bge     t0, s4, .lp_cpx_done
-    slli    t1, t0, 3
-    add     t2, s5, t1
-    fld     ft0, 0(t2)
-    add     t2, s0, t1
-    fsd     ft0, 0(t2)
-    addi    t0, t0, 1
-    j       .lp_cpx
-.lp_cpx_done:
+    # ---- x_new = F @ x  (mat_vec_mul: F(276x276), x(276)) ------------------
+    # We compute in-place: use y field or a stack buf.
+    # Use a stack-allocated 276*8=2208 byte buf for x_new
+    li      t0, 276; slli t0, t0, 3   # 2208
+    sub     sp, sp, t0
+    mv      t1, sp                    # x_new on stack
 
-    # ---- Step 2: tmpNN = F * P  (276×276 × 276×276) ----
-    li      s7, 0                   # i
-.lp_FP_i:
-    bge     s7, s4, .lp_FP_done
-    li      t2, 0                   # j
-.lp_FP_j:
-    bge     t2, s4, .lp_FP_jd
-    fcvt.d.w ft0, zero
-    li      t3, 0                   # k
-    # &F[i][0]
-    mul     t0, s7, s4
-    slli    t0, t0, 3
-    add     t0, s2, t0
-.lp_FP_k:
-    bge     t3, s4, .lp_FP_kd
-    fld     ft1, 0(t0)              # F[i][k]
-    mul     t1, t3, s4
-    add     t1, t1, t2
-    slli    t1, t1, 3
-    add     t1, s1, t1
-    fld     ft2, 0(t1)              # P[k][j]
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t0, t0, 8
-    addi    t3, t3, 1
-    j       .lp_FP_k
-.lp_FP_kd:
-    mul     t3, s7, s4
-    add     t3, t3, t2
-    slli    t3, t3, 3
-    add     t3, s6, t3
-    fsd     ft0, 0(t3)              # tmpNN[i][j]
-    addi    t2, t2, 1
-    j       .lp_FP_j
-.lp_FP_jd:
-    addi    s7, s7, 1
-    j       .lp_FP_i
-.lp_FP_done:
+    mv      a0, t1; mv a1, s3; mv a2, s1
+    li      a3, 276; li a4, 276
+    call    mat_vec_mul         # x_new = F @ x
 
-    # ---- Step 3: P = tmpNN * F^T + Q ----
-    # P[i][j] = sum_k tmpNN[i][k] * F[j][k]  + Q[i][j]
-    li      s7, 0                   # i
-.lp_PF_i:
-    bge     s7, s4, .lp_PF_done
-    li      t2, 0                   # j
-.lp_PF_j:
-    bge     t2, s4, .lp_PF_jd
-    fcvt.d.w ft0, zero
-    li      t3, 0                   # k
-.lp_PF_k:
-    bge     t3, s4, .lp_PF_kd
-    # tmpNN[i][k]
-    mul     t0, s7, s4
-    add     t0, t0, t3
-    slli    t0, t0, 3
-    add     t0, s6, t0
-    fld     ft1, 0(t0)
-    # F[j][k]  (= F^T[k][j])
-    mul     t1, t2, s4
-    add     t1, t1, t3
-    slli    t1, t1, 3
-    add     t1, s2, t1
-    fld     ft2, 0(t1)
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t3, t3, 1
-    j       .lp_PF_k
-.lp_PF_kd:
-    # Add Q[i][j]
-    mul     t0, s7, s4
-    add     t0, t0, t2
-    slli    t0, t0, 3
-    add     t0, s3, t0
-    fld     ft1, 0(t0)
-    fadd.d  ft0, ft0, ft1
-    # Store P[i][j]
-    mul     t0, s7, s4
-    add     t0, t0, t2
-    slli    t0, t0, 3
-    add     t0, s1, t0
-    fsd     ft0, 0(t0)
-    addi    t2, t2, 1
-    j       .lp_PF_j
-.lp_PF_jd:
-    addi    s7, s7, 1
-    j       .lp_PF_i
-.lp_PF_done:
+    # copy x_new -> x
+    mv      t2, s1; mv t3, t1
+    li      t4, 276; slli t4, t4, 3; add t4, t2, t4
+.Lpr_xcopy:
+    bge     t2, t4, .Lpr_xcopy_done
+    fld     ft0, 0(t3); fsd ft0, 0(t2)
+    addi    t2, t2, 8; addi t3, t3, 8; j .Lpr_xcopy
+.Lpr_xcopy_done:
+    # free x_new stack buf
+    li      t0, 276; slli t0, t0, 3; add sp, sp, t0
 
-    ld      s7, 56(sp)
-    ld      s6, 48(sp)
-    ld      s5, 40(sp)
-    ld      s4, 32(sp)
-    ld      s3, 24(sp)
-    ld      s2, 16(sp)
-    ld      s1,  8(sp)
-    ld      s0,  0(sp)
-    ld      ra, 72(sp)
-    addi    sp, sp, 80
-    ret
+    # ---- P_new = F @ P @ F^T + Q --------------------------------------------
+    # Step 1: Ftmp = F @ P   (276×276)
+    mv      a0, s5; mv a1, s3; mv a2, s2
+    li      a3, 276; li a4, 276; li a5, 276
+    call    mat_mul
+
+    # Step 2: FT = F^T
+    mv      a0, s6; mv a1, s3; li a2, 276; li a3, 276
+    call    mat_transpose
+
+    # Step 3: P = Ftmp @ FT  (write directly into P)
+    mv      a0, s2; mv a1, s5; mv a2, s6
+    li      a3, 276; li a4, 276; li a5, 276
+    call    mat_mul
+
+    # Step 4: P = P + Q
+    mv      a0, s2; mv a1, s2; mv a2, s4
+    li      a3, 276; li a4, 276
+    call    mat_add
+
+    ld      ra,  0(sp); ld s0,  8(sp); ld s1, 16(sp)
+    ld      s2, 24(sp); ld s3, 32(sp); ld s4, 40(sp)
+    ld      s5, 48(sp); ld s6, 56(sp)
+    addi    sp, sp, 64; ret
+    .size lkf_predict, .-lkf_predict
+
 
 # =============================================================================
-# lkf_lu_inverse -- LU decomposition + back-substitution matrix inverse
-# =============================================================================
-# Args:
-#   a0 = double *A      (n×n, OVERWRITTEN with LU factors)
-#   a1 = double *Ainv   (n×n output)
-#   a2 = int n          (= 69 for LKF)
-#   a3 = int *pivot     (n ints, pivot index array)
-# Return: a0 = 0 (OK) or -1 (singular)
+#  lkf_update  —  measurement update step
 #
-# Algorithm: Gaussian elimination with partial pivoting.
-# fnmsub.d used for elimination step: A[i][j] -= m * A[k][j]
-# =============================================================================
-    .globl lkf_lu_inverse
-lkf_lu_inverse:
-    addi    sp, sp, -80
-    sd      ra, 72(sp)
-    sd      s0,  0(sp)
-    sd      s1,  8(sp)
-    sd      s2, 16(sp)
-    sd      s3, 24(sp)
-    sd      s4, 32(sp)
-    sd      s5, 40(sp)
-    sd      s6, 48(sp)
-    fsd     fs0, 56(sp)
-    fsd     fs1, 64(sp)
-
-    mv      s0, a0                  # A
-    mv      s1, a1                  # Ainv
-    mv      s2, a2                  # n
-    mv      s3, a3                  # pivot
-
-    la      t0, .lkf_const_eps
-    fld     fs1, 0(t0)              # fs1 = eps (singularity threshold)
-
-    # ---- Phase 1: LU factorisation with partial pivoting ----
-    li      s4, 0                   # col k
-.lu_col:
-    bge     s4, s2, .lu_factor_done
-
-    # Find max |A[i][k]| for i >= k
-    fcvt.d.w fs0, zero              # running max = 0
-    mv      t5, s4                  # best pivot row
-    mv      t0, s4
-.lu_ps:                             # pivot search
-    bge     t0, s2, .lu_pd
-    mul     t1, t0, s2
-    add     t1, t1, s4
-    slli    t1, t1, 3
-    add     t1, s0, t1
-    fld     ft0, 0(t1)
-    fabs.d  ft0, ft0
-    flt.d   t2, fs0, ft0
-    beq     t2, zero, .lu_psn
-    fmv.d   fs0, ft0
-    mv      t5, t0
-.lu_psn:
-    addi    t0, t0, 1
-    j       .lu_ps
-.lu_pd:
-
-    # Store pivot index
-    slli    t0, s4, 2
-    add     t0, s3, t0
-    sw      t5, 0(t0)
-
-    # Singularity check
-    flt.d   t2, fs0, fs1
-    feq.d   t3, fs0, fs1
-    or      t2, t2, t3
-    beq     t2, zero, .lu_ns
-    li      a0, -1
-    j       .lu_ret
-.lu_ns:
-
-    # Swap rows k and t5
-    beq     t5, s4, .lu_no_swap
-    mv      s5, zero
-.lu_sw:
-    bge     s5, s2, .lu_no_swap
-    mul     t0, s4, s2
-    add     t0, t0, s5
-    slli    t0, t0, 3
-    add     t0, s0, t0
-    fld     ft0, 0(t0)
-    mul     t1, t5, s2
-    add     t1, t1, s5
-    slli    t1, t1, 3
-    add     t1, s0, t1
-    fld     ft1, 0(t1)
-    fsd     ft1, 0(t0)
-    fsd     ft0, 0(t1)
-    addi    s5, s5, 1
-    j       .lu_sw
-.lu_no_swap:
-
-    # Pivot element A[k][k]
-    mul     t0, s4, s2
-    add     t0, t0, s4
-    slli    t0, t0, 3
-    add     t0, s0, t0
-    fld     fs0, 0(t0)              # fs0 = A[k][k]
-
-    # Eliminate rows below k
-    addi    s5, s4, 1               # i = k+1
-.lu_er:
-    bge     s5, s2, .lu_er_done
-    mul     t0, s5, s2
-    add     t0, t0, s4
-    slli    t0, t0, 3
-    add     t0, s0, t0
-    fld     ft0, 0(t0)
-    fdiv.d  ft0, ft0, fs0           # m = A[i][k] / A[k][k]
-    fsd     ft0, 0(t0)              # A[i][k] = m  (stores L)
-
-    addi    s6, s4, 1               # j = k+1
-.lu_ec:
-    bge     s6, s2, .lu_ec_done
-    mul     t1, s4, s2
-    add     t1, t1, s6
-    slli    t1, t1, 3
-    add     t1, s0, t1
-    fld     ft1, 0(t1)              # A[k][j]
-    mul     t2, s5, s2
-    add     t2, t2, s6
-    slli    t2, t2, 3
-    add     t2, s0, t2
-    fld     ft2, 0(t2)              # A[i][j]
-    fnmsub.d ft2, ft0, ft1, ft2    # A[i][j] = A[i][j] - m*A[k][j]
-    fsd     ft2, 0(t2)
-    addi    s6, s6, 1
-    j       .lu_ec
-.lu_ec_done:
-    addi    s5, s5, 1
-    j       .lu_er
-.lu_er_done:
-    addi    s4, s4, 1
-    j       .lu_col
-.lu_factor_done:
-
-    # ---- Phase 2: Solve A*X = I column by column ----
-    li      s4, 0                   # column c of identity
-.lu_sc:
-    bge     s4, s2, .lu_all_done
-
-    # Initialise Ainv column c: e_c
-    li      t0, 0
-.lu_rhs:
-    bge     t0, s2, .lu_rhs_done
-    mul     t1, t0, s2
-    add     t1, t1, s4
-    slli    t1, t1, 3
-    add     t1, s1, t1
-    fcvt.d.w ft0, zero
-    beq     t0, s4, .lu_rhs1
-    fsd     ft0, 0(t1)
-    j       .lu_rhs_n
-.lu_rhs1:
-    la      t2, .lkf_const_one
-    fld     ft0, 0(t2)
-    fsd     ft0, 0(t1)
-.lu_rhs_n:
-    addi    t0, t0, 1
-    j       .lu_rhs
-.lu_rhs_done:
-
-    # Apply row permutations
-    li      t0, 0
-.lu_perm:
-    bge     t0, s2, .lu_perm_done
-    slli    t1, t0, 2
-    add     t1, s3, t1
-    lw      t2, 0(t1)               # pivot row
-    beq     t2, t0, .lu_pn
-    mul     t3, t0, s2
-    add     t3, t3, s4
-    slli    t3, t3, 3
-    add     t3, s1, t3
-    fld     ft0, 0(t3)
-    mul     t4, t2, s2
-    add     t4, t4, s4
-    slli    t4, t4, 3
-    add     t4, s1, t4
-    fld     ft1, 0(t4)
-    fsd     ft1, 0(t3)
-    fsd     ft0, 0(t4)
-.lu_pn:
-    addi    t0, t0, 1
-    j       .lu_perm
-.lu_perm_done:
-
-    # Forward substitution: L*y = b (L has 1s on diagonal)
-    li      t0, 1
-.lu_fwd:
-    bge     t0, s2, .lu_fwd_done
-    fcvt.d.w ft0, zero
-    li      t1, 0
-.lu_fi:
-    bge     t1, t0, .lu_fi_done
-    mul     t2, t0, s2
-    add     t2, t2, t1
-    slli    t2, t2, 3
-    add     t2, s0, t2
-    fld     ft1, 0(t2)              # L[i][j]
-    mul     t3, t1, s2
-    add     t3, t3, s4
-    slli    t3, t3, 3
-    add     t3, s1, t3
-    fld     ft2, 0(t3)              # y[j]
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t1, t1, 1
-    j       .lu_fi
-.lu_fi_done:
-    mul     t2, t0, s2
-    add     t2, t2, s4
-    slli    t2, t2, 3
-    add     t2, s1, t2
-    fld     ft1, 0(t2)
-    fsub.d  ft1, ft1, ft0
-    fsd     ft1, 0(t2)
-    addi    t0, t0, 1
-    j       .lu_fwd
-.lu_fwd_done:
-
-    # Back substitution: U*x = y
-    addi    t0, s2, -1              # i = n-1
-.lu_bck:
-    bltz    t0, .lu_bck_done
-    fcvt.d.w ft0, zero
-    addi    t1, t0, 1               # j = i+1
-.lu_bi:
-    bge     t1, s2, .lu_bi_done
-    mul     t2, t0, s2
-    add     t2, t2, t1
-    slli    t2, t2, 3
-    add     t2, s0, t2
-    fld     ft1, 0(t2)              # U[i][j]
-    mul     t3, t1, s2
-    add     t3, t3, s4
-    slli    t3, t3, 3
-    add     t3, s1, t3
-    fld     ft2, 0(t3)              # x[j]
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t1, t1, 1
-    j       .lu_bi
-.lu_bi_done:
-    mul     t2, t0, s2
-    add     t2, t2, t0
-    slli    t2, t2, 3
-    add     t2, s0, t2
-    fld     ft1, 0(t2)              # U[i][i]
-    mul     t3, t0, s2
-    add     t3, t3, s4
-    slli    t3, t3, 3
-    add     t3, s1, t3
-    fld     ft2, 0(t3)
-    fsub.d  ft2, ft2, ft0
-    fdiv.d  ft2, ft2, ft1
-    fsd     ft2, 0(t3)
-    addi    t0, t0, -1
-    j       .lu_bck
-.lu_bck_done:
-    addi    s4, s4, 1
-    j       .lu_sc
-
-.lu_all_done:
-    li      a0, 0
-.lu_ret:
-    fld     fs1, 64(sp)
-    fld     fs0, 56(sp)
-    ld      s6, 48(sp)
-    ld      s5, 40(sp)
-    ld      s4, 32(sp)
-    ld      s3, 24(sp)
-    ld      s2, 16(sp)
-    ld      s1,  8(sp)
-    ld      s0,  0(sp)
-    ld      ra, 72(sp)
-    addi    sp, sp, 80
-    ret
-
-# =============================================================================
-# lkf_update -- LKF update step (linear Cartesian measurement model)
-# =============================================================================
-# Args (first 8 in registers, rest on stack relative to caller sp):
-#   a0 = double *x             (276-D state, in/out)
-#   a1 = double *P             (276×276 covariance, in/out)
-#   a2 = const double *H       (69×276 fixed measurement matrix)
-#   a3 = const double *R_cart  (69×69 Cartesian noise)
-#   a4 = const double *meas_cart (NUM_JOINTS*3 = 69 doubles, flat Cartesian)
-#   a5 = double *K_buf         (276×69 scratch)
-#   a6 = double *S_buf         (69×69 scratch, filled then inverted)
-#   a7 = double *PHt_buf       (276×69 scratch)
-#   [sp+0]  = double *y_buf    (69 scratch — innovation vector)
-#   [sp+8]  = double *Sinv_buf (69×69 scratch — S inverse)
-#   [sp+16] = double *IKH_buf  (2×276×276 scratch — Joseph form)
-#   [sp+24] = int     N_joints (= 23)
-#   [sp+32] = int    *pivot_buf (69 ints)
+#  Python:
+#    z = flat measurement vector (69,)         [built from measurements]
+#    y  = z - H @ x                            (innovation, 69)
+#    PHt = P @ H.T                             (276×69)
+#    S   = H @ PHt + R                         (69×69)
+#    Sinv, ok = mat_inverse_nxn(S)
+#    if not ok: warn and return
+#    K   = PHt @ Sinv                          (276×69)
+#    x   = x + K @ y
+#    P   = mat_joseph_update(P, K, H, R)
 #
-# Steps:
-#   1. Build z (69-D): z[j*3..j*3+2] = meas_cart[j*3..j*3+2]
-#   2. y = z - H*x                                  (69-D innovation)
-#   3. PHt = P * H^T                                (276×69)
-#   4. S = H * PHt + R                              (69×69)
-#   5. S^{-1} via LU  -> Sinv_buf
-#   6. K = PHt * S^{-1}                             (276×69)
-#   7. x += K * y
-#   8. P = (I-K*H)*P*(I-K*H)^T + K*R*K^T  (Joseph form)
+#  void lkf_update(void *lkf, const double *z_flat)
+#  a0=lkf, a1=z_flat  (pre-built 69-element Cartesian measurement vector)
+#
+#  Note: z_flat is already the packed (NUM_JOINTS*3,) Cartesian array,
+#        matching self.z built in the Python update() method.
+#
+#  Scratch layout inside the struct (reused across calls):
+#    PHt[276×69]  @ OFF_PHt
+#    S[69×69]     @ OFF_S
+#    Sinv[69×69]  @ OFF_Sinv
+#    y[69]        @ OFF_y
+#    piv[69]      @ OFF_piv   (int32)
+#    jscratch[4*276*276] @ OFF_jscratch  (Joseph form)
+#
+#  Register map:
+#    s0=lkf  s1=&x  s2=&P  s3=&H  s4=&R
+#    s5=&PHt s6=&S  s7=&Sinv  s8=&y  s9=z_flat  s10=&piv  s11=&jscratch
 # =============================================================================
     .globl lkf_update
+    .type  lkf_update, @function
 lkf_update:
-    addi    sp, sp, -128
-    sd      ra, 120(sp)
-    sd      s0,   0(sp)
-    sd      s1,   8(sp)
-    sd      s2,  16(sp)
-    sd      s3,  24(sp)
-    sd      s4,  32(sp)
-    sd      s5,  40(sp)
-    sd      s6,  48(sp)
-    sd      s7,  56(sp)
-    sd      s8,  64(sp)
-    sd      s9,  72(sp)
-    sd      s10, 80(sp)
-    sd      s11, 88(sp)
-    fsd     fs0, 96(sp)
-    fsd     fs1,104(sp)
-    fsd     fs2,112(sp)
+    addi    sp, sp, -104
+    sd      ra,  0(sp); sd s0,  8(sp); sd s1, 16(sp); sd s2, 24(sp)
+    sd      s3, 32(sp); sd s4, 40(sp); sd s5, 48(sp); sd s6, 56(sp)
+    sd      s7, 64(sp); sd s8, 72(sp); sd s9, 80(sp); sd s10, 88(sp)
+    sd      s11, 96(sp)
 
-    mv      s0, a0              # x
-    mv      s1, a1              # P
-    mv      s2, a2              # H
-    mv      s3, a3              # R_cart
-    mv      s4, a4              # meas_cart
-    mv      s5, a5              # K_buf
-    mv      s6, a6              # S_buf
-    mv      s7, a7              # PHt_buf
+    mv      s0, a0
+    mv      s9, a1              # z_flat (69 doubles, already packed)
 
-    # Stack args: caller's original sp = our sp+128
-    ld      s8,  128(sp)        # y_buf
-    ld      s9,  136(sp)        # Sinv_buf
-    ld      s10, 144(sp)        # IKH_buf
-    # s11 = N_joints, pivot loaded lazily
+    # load all field pointers
+    la      t0, lkf_OFF_x;        ld t0, 0(t0); add s1, s0, t0
+    la      t0, lkf_OFF_P;        ld t0, 0(t0); add s2, s0, t0
+    la      t0, lkf_OFF_H;        ld t0, 0(t0); add s3, s0, t0
+    la      t0, lkf_OFF_R;        ld t0, 0(t0); add s4, s0, t0
+    la      t0, lkf_OFF_PHt;      ld t0, 0(t0); add s5, s0, t0
+    la      t0, lkf_OFF_S;        ld t0, 0(t0); add s6, s0, t0
+    la      t0, lkf_OFF_Sinv;     ld t0, 0(t0); add s7, s0, t0
+    la      t0, lkf_OFF_y;        ld t0, 0(t0); add s8, s0, t0
+    la      t0, lkf_OFF_piv;      ld t0, 0(t0); add s10, s0, t0
+    la      t0, lkf_OFF_jscratch; ld t0, 0(t0); add s11, s0, t0
 
-    # ---- Step 1: Build z = meas_cart flattened (already 69-D contiguous) ----
-    # The Python copies meas[j*3..+2] -> z[j*3..+2].  Since meas_cart is
-    # already flat and contiguous, z IS meas_cart.  We use s4 directly.
+    # ---- Step 1: y = z - H @ x  (innovation) --------------------------------
+    # z_pred = H @ x  (69×276 × 276 → 69)  stored in y first
+    mv      a0, s8; mv a1, s3; mv a2, s1
+    li      a3, 69; li a4, 276
+    call    mat_vec_mul         # y = H @ x  (z_pred)
 
-    # ---- Step 2: y = z - H*x  (69-D) ----
-    # y[i] = z[i] - sum_j H[i][j]*x[j]
-    li      t6, 69
-    li      t5, 276
-    li      t0, 0               # i
-.lu_y_i:
-    bge     t0, t6, .lu_y_done
-    fcvt.d.w ft0, zero
-    li      t1, 0               # j
-    mul     t2, t0, t5          # H row byte start (element offset)
-    slli    t2, t2, 3
-    add     t2, s2, t2          # &H[i][0]
-    mv      t3, s0              # &x[0]
-.lu_y_k:
-    bge     t1, t5, .lu_y_kd
-    fld     ft1, 0(t2)          # H[i][j]
-    fld     ft2, 0(t3)          # x[j]
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t2, t2, 8
-    addi    t3, t3, 8
-    addi    t1, t1, 1
-    j       .lu_y_k
-.lu_y_kd:
-    # y[i] = z[i] - Hx[i]
-    slli    t1, t0, 3
-    add     t2, s4, t1          # z[i]
-    fld     ft1, 0(t2)
-    fsub.d  ft0, ft1, ft0
-    add     t2, s8, t1
-    fsd     ft0, 0(t2)          # y[i]
-    addi    t0, t0, 1
-    j       .lu_y_i
-.lu_y_done:
+    # y = z_flat - y  (y = z - H@x)
+    mv      a0, s8; mv a1, s9; mv a2, s8
+    li      a3, 1; li a4, 69
+    call    mat_sub             # y = z - z_pred  (1×69 treated as flat vector)
 
-    # ---- Step 3: PHt = P * H^T  (276×276 * 276×69 = 276×69) ----
-    # H is 69×276 so H^T is 276×69.
-    # PHt[i][j] = sum_k P[i][k] * H[j][k]  (H^T[k][j] = H[j][k])
-    li      s11, 276            # row count
-    li      t6, 69
-    li      t0, 0               # i
-.lu_PHt_i:
-    bge     t0, s11, .lu_PHt_done
-    li      t2, 0               # j
-.lu_PHt_j:
-    bge     t2, t6, .lu_PHt_jd
-    fcvt.d.w ft0, zero
-    li      t3, 0               # k
-.lu_PHt_k:
-    bge     t3, s11, .lu_PHt_kd
-    mul     t4, t0, s11
-    add     t4, t4, t3
-    slli    t4, t4, 3
-    add     t4, s1, t4
-    fld     ft1, 0(t4)          # P[i][k]
-    mul     t4, t2, s11
-    add     t4, t4, t3
-    slli    t4, t4, 3
-    add     t4, s2, t4
-    fld     ft2, 0(t4)          # H[j][k] = H^T[k][j]
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t3, t3, 1
-    j       .lu_PHt_k
-.lu_PHt_kd:
-    mul     t4, t0, t6
-    add     t4, t4, t2
-    slli    t4, t4, 3
-    add     t4, s7, t4
-    fsd     ft0, 0(t4)          # PHt[i][j]
-    addi    t2, t2, 1
-    j       .lu_PHt_j
-.lu_PHt_jd:
-    addi    t0, t0, 1
-    j       .lu_PHt_i
-.lu_PHt_done:
+    # ---- Step 2: PHt = P @ H^T  (276×276 × 276×69 → 276×69) ----------------
+    # We need H^T (276×69). H is 69×276.
+    # Optimisation: H is block-diagonal with only 3 nonzero entries per 3×12 block.
+    # For generality (and correctness vs Python), compute H^T explicitly.
+    # Use S scratch as temp for HT (276×69 = 152208 bytes; S is 38088 bytes).
+    # S is too small. Use jscratch first 276*69*8=152208 bytes for HT.
+    mv      a0, s11; mv a1, s3; li a2, 69; li a3, 276
+    call    mat_transpose       # jscratch[0..152207] = H^T (276×69)
 
-    # ---- Step 4: S = H * PHt + R  (69×276 * 276×69 + 69×69 = 69×69) ----
-    li      t6, 69
-    li      t5, 276
-    li      t0, 0               # i
-.lu_S_i:
-    bge     t0, t6, .lu_S_done
-    li      t2, 0               # j
-.lu_S_j:
-    bge     t2, t6, .lu_S_jd
-    fcvt.d.w ft0, zero
-    li      t3, 0               # k
-.lu_S_k:
-    bge     t3, t5, .lu_S_kd
-    mul     t4, t0, t5
-    add     t4, t4, t3
-    slli    t4, t4, 3
-    add     t4, s2, t4
-    fld     ft1, 0(t4)          # H[i][k]
-    mul     t4, t3, t6
-    add     t4, t4, t2
-    slli    t4, t4, 3
-    add     t4, s7, t4
-    fld     ft2, 0(t4)          # PHt[k][j]
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t3, t3, 1
-    j       .lu_S_k
-.lu_S_kd:
-    # Add R[i][j]
-    mul     t3, t0, t6
-    add     t3, t3, t2
-    slli    t3, t3, 3
-    add     t3, s3, t3
-    fld     ft1, 0(t3)
-    fadd.d  ft0, ft0, ft1
-    # Store S[i][j]
-    mul     t3, t0, t6
-    add     t3, t3, t2
-    slli    t3, t3, 3
-    add     t3, s6, t3
-    fsd     ft0, 0(t3)
-    addi    t2, t2, 1
-    j       .lu_S_j
-.lu_S_jd:
-    addi    t0, t0, 1
-    j       .lu_S_i
-.lu_S_done:
+    # PHt = P @ H^T  (276×276 × 276×69 → 276×69)
+    mv      a0, s5; mv a1, s2; mv a2, s11
+    li      a3, 276; li a4, 276; li a5, 69
+    call    mat_mul
 
-    # ---- Step 5: S^{-1} via LU  (s6 = S -> LU factors; s9 = Sinv) ----
-    ld      t6, 160(sp)         # pivot_buf  (original sp+32 = our sp+32+128=160)
-    mv      a0, s6              # A = S (overwritten with LU)
-    mv      a1, s9              # Ainv
-    li      a2, 69
-    mv      a3, t6
-    call    lkf_lu_inverse
-    beq     a0, zero, .lu_inv_ok
-    j       .lu_upd_done        # singular: skip update
-.lu_inv_ok:
+    # ---- Step 3: S = H @ PHt + R  (69×276 × 276×69 → 69×69) ---------------
+    mv      a0, s6; mv a1, s3; mv a2, s5
+    li      a3, 69; li a4, 276; li a5, 69
+    call    mat_mul             # S = H @ PHt
 
-    # ---- Step 6: K = PHt * S^{-1}  (276×69 * 69×69 = 276×69) ----
-    li      t6, 276
-    li      t5, 69
-    li      t0, 0               # i
-.lu_K_i:
-    bge     t0, t6, .lu_K_done
-    li      t2, 0               # j
-.lu_K_j:
-    bge     t2, t5, .lu_K_jd
-    fcvt.d.w ft0, zero
-    li      t3, 0               # k
-.lu_K_k:
-    bge     t3, t5, .lu_K_kd
-    mul     t4, t0, t5
-    add     t4, t4, t3
-    slli    t4, t4, 3
-    add     t4, s7, t4
-    fld     ft1, 0(t4)          # PHt[i][k]
-    mul     t4, t3, t5
-    add     t4, t4, t2
-    slli    t4, t4, 3
-    add     t4, s9, t4
-    fld     ft2, 0(t4)          # Sinv[k][j]
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t3, t3, 1
-    j       .lu_K_k
-.lu_K_kd:
-    mul     t4, t0, t5
-    add     t4, t4, t2
-    slli    t4, t4, 3
-    add     t4, s5, t4
-    fsd     ft0, 0(t4)          # K[i][j]
-    addi    t2, t2, 1
-    j       .lu_K_j
-.lu_K_jd:
-    addi    t0, t0, 1
-    j       .lu_K_i
-.lu_K_done:
+    mv      a0, s6; mv a1, s6; mv a2, s4
+    li      a3, 69; li a4, 69
+    call    mat_add             # S = S + R
 
-    # ---- Step 7: x += K * y  (276×69 * 69×1 = 276×1) ----
-    li      t6, 276
-    li      t5, 69
-    li      t0, 0               # i
-.lu_xu_i:
-    bge     t0, t6, .lu_xu_done
-    fcvt.d.w ft0, zero
-    li      t1, 0               # k
-.lu_xu_k:
-    bge     t1, t5, .lu_xu_kd
-    mul     t2, t0, t5
-    add     t2, t2, t1
-    slli    t2, t2, 3
-    add     t2, s5, t2
-    fld     ft1, 0(t2)          # K[i][k]
-    slli    t2, t1, 3
-    add     t2, s8, t2
-    fld     ft2, 0(t2)          # y[k]
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t1, t1, 1
-    j       .lu_xu_k
-.lu_xu_kd:
-    slli    t1, t0, 3
-    add     t1, s0, t1
-    fld     ft1, 0(t1)
-    fadd.d  ft1, ft1, ft0
-    fsd     ft1, 0(t1)
-    addi    t0, t0, 1
-    j       .lu_xu_i
-.lu_xu_done:
+    # ---- Step 4: Sinv = S^{-1}  (69×69) ------------------------------------
+    mv      a0, s7; mv a1, s6; li a2, 69; mv a3, s10
+    call    mat_inverse_nxn     # returns 1=ok, 0=singular in a0
 
-    # ---- Step 8: Joseph-form covariance update ----
-    # P = (I - K*H) * P * (I - K*H)^T + K*R*K^T
-    #
-    # 8a. IKH = I  (276×276)  -- stored in first half of IKH_buf
-    mv      t6, s10             # IKH_buf
-    li      t0, 76176
-    mv      t1, t6
-    fcvt.d.w ft0, zero
-.lu_IKH_z:
-    fsd     ft0, 0(t1)
-    addi    t1, t1, 8
-    addi    t0, t0, -1
-    bne     t0, zero, .lu_IKH_z
-    la      t0, .lkf_const_one
-    fld     fs0, 0(t0)
-    li      t0, 0
-    li      t2, 2216            # 277*8
-    mv      t1, t6
-.lu_IKH_d:
-    li      t3, 276
-    bge     t0, t3, .lu_IKH_dd
-    fsd     fs0, 0(t1)
-    add     t1, t1, t2
-    addi    t0, t0, 1
-    j       .lu_IKH_d
-.lu_IKH_dd:
+    # Check singularity
+    bnez    a0, .Lupd_ok
+    # Singular: print warning and skip update
+    la      a0, .Lwarn_singular
+    call    puts
+    j       .Lupd_done
 
-    # 8b. IKH -= K*H  (276×276)
-    li      t5, 276
-    li      t4, 69
-    li      t0, 0               # i
-.lu_KH_i:
-    bge     t0, t5, .lu_KH_done
-    li      t2, 0               # j
-.lu_KH_j:
-    bge     t2, t5, .lu_KH_jd
-    fcvt.d.w ft0, zero
-    li      t3, 0               # k
-.lu_KH_k:
-    bge     t3, t4, .lu_KH_kd
-    mul     t1, t0, t4
-    add     t1, t1, t3
-    slli    t1, t1, 3
-    add     t1, s5, t1
-    fld     ft1, 0(t1)          # K[i][k]
-    mul     t1, t3, t5
-    add     t1, t1, t2
-    slli    t1, t1, 3
-    add     t1, s2, t1
-    fld     ft2, 0(t1)          # H[k][j]
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t3, t3, 1
-    j       .lu_KH_k
-.lu_KH_kd:
-    mul     t1, t0, t5
-    add     t1, t1, t2
-    slli    t1, t1, 3
-    add     t1, t6, t1
-    fld     ft1, 0(t1)          # IKH[i][j]
-    fsub.d  ft1, ft1, ft0
-    fsd     ft1, 0(t1)
-    addi    t2, t2, 1
-    j       .lu_KH_j
-.lu_KH_jd:
-    addi    t0, t0, 1
-    j       .lu_KH_i
-.lu_KH_done:
+.Lupd_ok:
+    # ---- Step 5: K = PHt @ Sinv  (276×69 × 69×69 → 276×69) ----------------
+    # Reuse jscratch for K (276×69 = 152208 bytes)
+    mv      a0, s11; mv a1, s5; mv a2, s7
+    li      a3, 276; li a4, 69; li a5, 69
+    call    mat_mul             # jscratch = K
 
-    # 8c. tmp1 = IKH * P  -> second half of IKH_buf
-    li      t5, 76176
-    slli    t5, t5, 3
-    add     s11, t6, t5         # s11 = IKH_buf + 276*276*8
+    # ---- Step 6: x = x + K @ y  (276×69 × 69 → 276) -----------------------
+    # K@y into a stack buffer (276*8=2208 bytes)
+    li      t0, 276; slli t0, t0, 3
+    sub     sp, sp, t0
+    mv      t1, sp              # Ky on stack
 
-    li      t5, 276
-    li      t0, 0               # i
-.lu_IKHP_i:
-    bge     t0, t5, .lu_IKHP_done
-    li      t2, 0               # j
-.lu_IKHP_j:
-    bge     t2, t5, .lu_IKHP_jd
-    fcvt.d.w ft0, zero
-    li      t3, 0               # k
-.lu_IKHP_k:
-    bge     t3, t5, .lu_IKHP_kd
-    mul     t1, t0, t5
-    add     t1, t1, t3
-    slli    t1, t1, 3
-    add     t1, t6, t1
-    fld     ft1, 0(t1)          # IKH[i][k]
-    mul     t1, t3, t5
-    add     t1, t1, t2
-    slli    t1, t1, 3
-    add     t1, s1, t1
-    fld     ft2, 0(t1)          # P[k][j]
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t3, t3, 1
-    j       .lu_IKHP_k
-.lu_IKHP_kd:
-    mul     t1, t0, t5
-    add     t1, t1, t2
-    slli    t1, t1, 3
-    add     t1, s11, t1
-    fsd     ft0, 0(t1)          # tmp1[i][j]
-    addi    t2, t2, 1
-    j       .lu_IKHP_j
-.lu_IKHP_jd:
-    addi    t0, t0, 1
-    j       .lu_IKHP_i
-.lu_IKHP_done:
+    mv      a0, t1; mv a1, s11; mv a2, s8
+    li      a3, 276; li a4, 69
+    call    mat_vec_mul         # Ky = K @ y
 
-    # 8d. P = tmp1 * IKH^T  -> stored in s1 (P)
-    li      t5, 276
-    li      t0, 0
-.lu_PF_i:
-    bge     t0, t5, .lu_PF_done
-    li      t2, 0
-.lu_PF_j:
-    bge     t2, t5, .lu_PF_jd
-    fcvt.d.w ft0, zero
-    li      t3, 0
-.lu_PF_k:
-    bge     t3, t5, .lu_PF_kd
-    mul     t1, t0, t5
-    add     t1, t1, t3
-    slli    t1, t1, 3
-    add     t1, s11, t1
-    fld     ft1, 0(t1)          # tmp1[i][k]
-    mul     t1, t2, t5          # IKH^T[k][j] = IKH[j][k]
-    add     t1, t1, t3
-    slli    t1, t1, 3
-    add     t1, t6, t1
-    fld     ft2, 0(t1)
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t3, t3, 1
-    j       .lu_PF_k
-.lu_PF_kd:
-    mul     t1, t0, t5
-    add     t1, t1, t2
-    slli    t1, t1, 3
-    add     t1, s1, t1
-    fsd     ft0, 0(t1)
-    addi    t2, t2, 1
-    j       .lu_PF_j
-.lu_PF_jd:
-    addi    t0, t0, 1
-    j       .lu_PF_i
-.lu_PF_done:
+    # x = x + Ky
+    mv      a0, s1; mv a1, s1; mv a2, t1
+    li      a3, 1; li a4, 276
+    call    mat_add
 
-    # 8e. KR = K * R  (276×69 * 69×69 = 276×69)  -> PHt_buf reuse
-    li      t5, 276
-    li      t4, 69
-    li      t0, 0
-.lu_KR_i:
-    bge     t0, t5, .lu_KR_done
-    li      t2, 0
-.lu_KR_j:
-    bge     t2, t4, .lu_KR_jd
-    fcvt.d.w ft0, zero
-    li      t3, 0
-.lu_KR_k:
-    bge     t3, t4, .lu_KR_kd
-    mul     t1, t0, t4
-    add     t1, t1, t3
-    slli    t1, t1, 3
-    add     t1, s5, t1
-    fld     ft1, 0(t1)          # K[i][k]
-    mul     t1, t3, t4
-    add     t1, t1, t2
-    slli    t1, t1, 3
-    add     t1, s3, t1
-    fld     ft2, 0(t1)          # R[k][j]
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t3, t3, 1
-    j       .lu_KR_k
-.lu_KR_kd:
-    mul     t1, t0, t4
-    add     t1, t1, t2
-    slli    t1, t1, 3
-    add     t1, s7, t1          # reuse PHt_buf for KR
-    fsd     ft0, 0(t1)
-    addi    t2, t2, 1
-    j       .lu_KR_j
-.lu_KR_jd:
-    addi    t0, t0, 1
-    j       .lu_KR_i
-.lu_KR_done:
+    li      t0, 276; slli t0, t0, 3; add sp, sp, t0   # free Ky
 
-    # 8f. P += KR * K^T  (276×69 * 69×276 = 276×276, add into P)
-    li      t5, 276
-    li      t4, 69
-    li      t0, 0
-.lu_KKT_i:
-    bge     t0, t5, .lu_KKT_done
-    li      t2, 0
-.lu_KKT_j:
-    bge     t2, t5, .lu_KKT_jd
-    fcvt.d.w ft0, zero
-    li      t3, 0
-.lu_KKT_k:
-    bge     t3, t4, .lu_KKT_kd
-    mul     t1, t0, t4
-    add     t1, t1, t3
-    slli    t1, t1, 3
-    add     t1, s7, t1          # KR[i][k]
-    fld     ft1, 0(t1)
-    mul     t1, t2, t4          # K^T[k][j] = K[j][k]
-    add     t1, t1, t3
-    slli    t1, t1, 3
-    add     t1, s5, t1
-    fld     ft2, 0(t1)
-    fmadd.d ft0, ft1, ft2, ft0
-    addi    t3, t3, 1
-    j       .lu_KKT_k
-.lu_KKT_kd:
-    mul     t1, t0, t5
-    add     t1, t1, t2
-    slli    t1, t1, 3
-    add     t1, s1, t1
-    fld     ft1, 0(t1)
-    fadd.d  ft1, ft1, ft0
-    fsd     ft1, 0(t1)
-    addi    t2, t2, 1
-    j       .lu_KKT_j
-.lu_KKT_jd:
-    addi    t0, t0, 1
-    j       .lu_KKT_i
-.lu_KKT_done:
+    # ---- Step 7: P = (I-KH)P(I-KH)^T + KRK^T  (Joseph form) ---------------
+    # mat_joseph_update(Pout, P, K, H, R, n, m, scratch)
+    # K = jscratch (276×69), scratch starts after K in jscratch
+    # jscratch layout: [K(276×69=152208B)] [joseph_scratch(4*276*276*8=2437632B)]
+    # joseph needs 4*n*n doubles = 4*276*276 for scratch, start after K
+    li      t0, 276; li t1, 69; mul t0, t0, t1; slli t0, t0, 3
+    add     t1, s11, t0         # &jscratch[276*69] = joseph scratch start
 
-.lu_upd_done:
-    fld     fs2,112(sp)
-    fld     fs1,104(sp)
-    fld     fs0, 96(sp)
-    ld      s11, 88(sp)
-    ld      s10, 80(sp)
-    ld      s9,  72(sp)
-    ld      s8,  64(sp)
-    ld      s7,  56(sp)
-    ld      s6,  48(sp)
-    ld      s5,  40(sp)
-    ld      s4,  32(sp)
-    ld      s3,  24(sp)
-    ld      s2,  16(sp)
-    ld      s1,   8(sp)
-    ld      s0,   0(sp)
-    ld      ra,  120(sp)
-    addi    sp, sp, 128
-    ret
+    mv      a0, s2              # Pout = P (in-place)
+    mv      a1, s2              # P
+    mv      a2, s11             # K
+    mv      a3, s3              # H
+    mv      a4, s4              # R
+    li      a5, 276             # n
+    li      a6, 69              # m
+    mv      a7, t1              # scratch
+    call    mat_joseph_update
+
+.Lupd_done:
+    ld      ra,  0(sp); ld s0,  8(sp); ld s1, 16(sp); ld s2, 24(sp)
+    ld      s3, 32(sp); ld s4, 40(sp); ld s5, 48(sp); ld s6, 56(sp)
+    ld      s7, 64(sp); ld s8, 72(sp); ld s9, 80(sp); ld s10, 88(sp)
+    ld      s11, 96(sp)
+    addi    sp, sp, 104; ret
+
+.Lwarn_singular:
+    .asciz  "[WARN] LKF: singular 69x69 S, skipping update\n"
+
+    .size lkf_update, .-lkf_update
+
 
 # =============================================================================
-# End of lkf_asm.s
+#  lkf_get_positions  —  extract (NUM_JOINTS, 3) position array
+#
+#  Python:
+#    for j in 0..22:
+#      b = j * 12
+#      pos[j] = [x[b], x[b+4], x[b+8]]
+#
+#  void lkf_get_positions(const void *lkf, double *pos_out)
+#  a0=lkf, a1=pos_out  (double[23*3] = double[69])
+# =============================================================================
+    .globl lkf_get_positions
+    .type  lkf_get_positions, @function
+lkf_get_positions:
+    la      t0, lkf_OFF_x; ld t0, 0(t0); add t0, a0, t0  # &x[0]
+    li      t1, 0               # j = 0
+.Lgp_j:
+    li      t2, 23
+    bge     t1, t2, .Lgp_done
+    # b = j*12;  &x[b] = t0 + b*8 = t0 + j*96
+    li      t2, 12; mul t2, t1, t2; slli t2, t2, 3
+    add     t3, t0, t2          # &x[b]
+    # pos[j*3+0] = x[b+0]
+    li      t4, 3; mul t4, t1, t4; slli t4, t4, 3; add t4, a1, t4  # &pos[j*3]
+    fld     ft0,  0(t3); fsd ft0, 0(t4)         # px
+    fld     ft0, 32(t3); fsd ft0, 8(t4)         # py = x[b+4]  (offset 4*8=32)
+    fld     ft0, 64(t3); fsd ft0,16(t4)         # pz = x[b+8]  (offset 8*8=64)
+    addi    t1, t1, 1; j .Lgp_j
+.Lgp_done:
+    ret
+    .size lkf_get_positions, .-lkf_get_positions
+
+
+# =============================================================================
+#  lkf_get_full_state  —  copy x[276] to output buffer
+#
+#  void lkf_get_full_state(const void *lkf, double *out)
+#  a0=lkf, a1=out (double[276])
+# =============================================================================
+    .globl lkf_get_full_state
+    .type  lkf_get_full_state, @function
+lkf_get_full_state:
+    la      t0, lkf_OFF_x; ld t0, 0(t0); add t0, a0, t0  # &x[0]
+    li      t1, 276; slli t1, t1, 3; add t2, t0, t1       # end ptr
+.Lgfs_loop:
+    bge     t0, t2, .Lgfs_done
+    fld     ft0, 0(t0); fsd ft0, 0(a1)
+    addi    t0, t0, 8; addi a1, a1, 8; j .Lgfs_loop
+.Lgfs_done:
+    ret
+    .size lkf_get_full_state, .-lkf_get_full_state
+
+# =============================================================================
+#  END OF lkf_asm.s
 # =============================================================================

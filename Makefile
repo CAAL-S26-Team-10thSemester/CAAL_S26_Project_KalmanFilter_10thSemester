@@ -125,23 +125,40 @@ verify: $(VERIFY_ELF)
 run_verify: $(VERIFY_ELF)
 	$(QEMU) ./$(VERIFY_ELF)
 
-$(LKF_OBJ): $(LKF_ASM)
-	$(AS) $(CFLAGS) -c $< -o $@
+# $(LKF_OBJ): $(LKF_ASM)
+# 	$(AS) $(CFLAGS) -c $< -o $@
 
-lkf: $(LKF_OBJ) $(MATRIX_OBJ)
-	$(LD) $(LDFLAGS) $^ -o $(LKF_ELF)
-	$(SPIKE) $(PK) ./$(LKF_ELF)
+# lkf: $(LKF_OBJ) $(MATRIX_OBJ)
+# 	$(LD) $(LDFLAGS) $^ -o $(LKF_ELF)
+# 	$(SPIKE) $(PK) ./$(LKF_ELF)
 
-$(EKF_OBJ): $(EKF_ASM)
-	$(AS) $(CFLAGS) -c $< -o $@
+# $(EKF_OBJ): $(EKF_ASM)
+# 	$(AS) $(CFLAGS) -c $< -o $@
 
-ekf: $(EKF_OBJ) $(MATRIX_OBJ)
-	$(LD) $(LDFLAGS) $^ -o $(EKF_ELF)
-	$(SPIKE) $(PK) ./$(EKF_ELF)
+# ekf: $(EKF_OBJ) $(MATRIX_OBJ)
+# 	$(LD) $(LDFLAGS) $^ -o $(EKF_ELF)
+# 	$(SPIKE) $(PK) ./$(EKF_ELF)
+
+# --- LKF ---
+LKF_RUN_SRC = lkf_runner.c
+LKF_RUN_OBJ = lkf_runner.o
+
+$(LKF_OBJ): lkf_asm.s matrix_asm.h
+	$(CC) $(CFLAGS) -c $< -o $@
+ 
+$(LKF_RUN_OBJ): lkf_runner.c matrix_asm.h
+	$(CC) $(CFLAGS) -c $< -o $@
+ 
+lkf_runner: $(LKF_RUN_OBJ) lkf_asm.o matrix_asm.o
+	$(CC) $(CFLAGS) $^ -o $@ -lm -static
+ 
+lkf: lkf_runner
+	@echo "--- Running LKF ---"
+	$(QEMU) ./lkf_runner
 
 # ─────────────────────────────────────────────
 # Cleanup
 # ─────────────────────────────────────────────
 clean:
-	rm -f *.o hello vector print_c insn.log \
+	rm -f *.o hello lkf_runner vector print_c insn.log \
 	      $(VERIFY_ELF) $(LKF_ELF) $(EKF_ELF)
