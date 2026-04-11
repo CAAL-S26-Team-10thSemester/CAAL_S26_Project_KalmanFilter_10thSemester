@@ -544,14 +544,16 @@ mat_inverse_nxn:
 #                         const double *H,   // m×n
 #                         const double *R,   // m×m
 #                         int n, int m,
-#                         double *scratch)   // >= 3*n*n doubles
+#                         double *scratch)
 #  a0=Pout a1=P a2=K a3=H a4=R a5=n a6=m a7=scratch
 #
 #  scratch layout:
 #    [0       .. n*n-1 ]  IKH  (n×n)
 #    [n*n     .. 2*n*n ]  tmp1 (n×n)
 #    [2*n*n   .. 3*n*n ]  tmp2 (n×n)
-#  KT buffer allocated on the stack (m*n doubles).
+#    [3*n*n   .. 4*n*n-1] K^T  (m×n)
+#  KT buffer placed in scratch[3*n*n .. 4*n*n-1]  (n*m doubles = n*n worst-case).
+#  Caller MUST provide >= 4*n*n doubles of scratch.
 # =============================================================================
     .globl mat_joseph_update
     .type  mat_joseph_update, @function
@@ -704,6 +706,8 @@ wrap_angle:
     ret
     .size wrap_angle, .-wrap_angle
 
+
 # =============================================================================
 #  END OF matrix_asm.s
 # =============================================================================
+
