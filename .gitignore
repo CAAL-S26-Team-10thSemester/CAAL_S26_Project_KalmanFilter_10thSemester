@@ -1,0 +1,19 @@
+# Compiled objects and binaries
+*.o
+ekf_verify_bin
+lkf_verify
+verify_matrix_asm
+
+# Generated CSV outputs (assembly results)
+ekf_asm_results.csv
+lkf_asm_results.csv
+lkf_asm_verification.csv
+
+# Generated plots and animations
+*.png
+*.mp4
+*.gif
+
+# Other
+desktop.ini
+insn.log
