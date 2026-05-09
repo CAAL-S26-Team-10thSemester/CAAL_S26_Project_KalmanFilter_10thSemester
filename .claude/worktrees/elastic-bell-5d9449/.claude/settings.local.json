@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la \"E:\\\\CAAL_S26_Project_KalmanFilter_10thSemester\")"
+    ]
+  }
+}

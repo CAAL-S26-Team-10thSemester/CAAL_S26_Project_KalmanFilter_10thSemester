@@ -195,7 +195,7 @@ mat_mul:
 mat_add:
     mul     t0, a3, a4;  slli t0, t0, 3
     add     t3, a0, t0          # end ptr
-    addi    t2, t3, -24         # unroll boundary (3 extra elements * 8)
+    addi    t2, t3, -32         # unroll boundary: need room for 4 doubles (32 B)
 .Ladd_u:
     bgt     a0, t2, .Ladd_t
     fld ft0, 0(a1);fld ft1, 0(a2);fadd.d ft0,ft0,ft1;fsd ft0, 0(a0)
@@ -224,7 +224,7 @@ mat_add:
 mat_sub:
     mul     t0, a3, a4;  slli t0, t0, 3
     add     t3, a0, t0
-    addi    t2, t3, -24
+    addi    t2, t3, -32         # unroll boundary: need room for 4 doubles (32 B)
 .Lsub_u:
     bgt     a0, t2, .Lsub_t
     fld ft0, 0(a1);fld ft1, 0(a2);fsub.d ft0,ft0,ft1;fsd ft0, 0(a0)
@@ -280,7 +280,7 @@ mat_transpose:
 mat_scale_add:
     mul     t0, a3, a4;  slli t0, t0, 3
     add     t3, a0, t0
-    addi    t2, t3, -24
+    addi    t2, t3, -32         # unroll boundary: need room for 4 doubles (32 B)
 .Lsa_u:
     bgt     a0, t2, .Lsa_t
     fld ft0, 0(a1);fld ft1, 0(a2);fmadd.d ft0,fa0,ft1,ft0;fsd ft0, 0(a0)
