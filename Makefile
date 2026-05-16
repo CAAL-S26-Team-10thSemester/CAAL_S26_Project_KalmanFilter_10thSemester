@@ -102,7 +102,8 @@ PLOT_JOINT  = 0
 # Phony targets
 # ─────────────────────────────────────────────
 .PHONY: all verify lkf ekf ekf_verify_ref plots clean \
-        lkf_vector ekf_vector all_vec
+        lkf_vector ekf_vector all_vec \
+        perf insn_lkf_scalar insn_lkf_vec insn_ekf_scalar insn_ekf_vec insn_count verify_matrix_vec
 
 all: verify lkf ekf
 all_vec: lkf_vector ekf_vector
@@ -292,6 +293,78 @@ ekf_vector: $(EKF_VEC_VER_ELF)
 	fi
 	$(QEMU_V) ./$(EKF_VEC_VER_ELF) "$(NOISY_CSV)" "$(EKF_REF_CSV)"
 
+# =============================================================================
+#  Milestone-4  —  Performance Analysis (§8)
+# =============================================================================
+
+# ── Matrix vec unit tests ──
+VERIFY_MAT_VEC_C   = verify_matrix_vec.c
+VERIFY_MAT_VEC_OBJ = verify_matrix_vec.o
+VERIFY_MAT_VEC_ELF = verify_matrix_vec
+
+$(VERIFY_MAT_VEC_OBJ): $(VERIFY_MAT_VEC_C)
+	$(CC) $(CFLAGS_V) -c $< -o $@
+
+$(VERIFY_MAT_VEC_ELF): $(VERIFY_MAT_VEC_OBJ) $(MATRIX_VEC_OBJ) $(MATRIX_OBJ)
+	$(CC) $(CFLAGS_V) $^ -o $@ -lm -static
+
+verify_matrix_vec: $(VERIFY_MAT_VEC_ELF)
+	@echo ""
+	@echo "=== Running matrix_vec numerical verification ==="
+	$(QEMU_V) ./$(VERIFY_MAT_VEC_ELF)
+
+# ── Performance comparison binary ──
+PERF_C   = perf_compare.c
+PERF_OBJ = perf_compare.o
+PERF_ELF = perf_compare
+PERF_FRAMES ?= 10
+
+$(PERF_OBJ): $(PERF_C)
+	$(CC) $(CFLAGS_V) -c $< -o $@
+
+$(PERF_ELF): $(PERF_OBJ) $(LKF_VEC_OBJ) $(EKF_VEC_OBJ) $(EKF_UTILS_VEC_OBJ) \
+             $(MATRIX_VEC_OBJ) $(LKF_OBJ) $(EKF_OBJ) $(MATRIX_OBJ)
+	$(CC) $(CFLAGS_V) $^ -o $@ -lm -static
+
+perf: $(PERF_ELF)
+	@echo ""
+	@echo "=== Milestone-4 Performance Analysis (§8) ==="
+	$(QEMU_V) ./$(PERF_ELF) "$(NOISY_CSV)" $(PERF_FRAMES)
+
+# ── Instruction-count profiling via QEMU plugin ──
+QEMU_PLUGIN = /usr/local/lib/qemu/plugins/libinsn.so
+
+insn_lkf_scalar: $(LKF_VER_ELF)
+	@echo "=== Counting instructions: LKF-M3 (scalar) ==="
+	$(QEMU) -plugin $(QEMU_PLUGIN) -d plugin -D insn_lkf_scalar.log \
+	    ./$(LKF_VER_ELF) "$(NOISY_CSV)" "$(LKF_REF_CSV)" 2>/dev/null || true
+	@tail -5 insn_lkf_scalar.log
+
+insn_lkf_vec: $(LKF_VEC_VER_ELF)
+	@echo "=== Counting instructions: LKF-M4 (vector) ==="
+	$(QEMU_V) -plugin $(QEMU_PLUGIN) -d plugin -D insn_lkf_vec.log \
+	    ./$(LKF_VEC_VER_ELF) "$(NOISY_CSV)" "$(LKF_REF_CSV)" 2>/dev/null || true
+	@tail -5 insn_lkf_vec.log
+
+insn_ekf_scalar: $(EKF_VER_ELF)
+	@echo "=== Counting instructions: EKF-M3 (scalar) ==="
+	$(QEMU) -plugin $(QEMU_PLUGIN) -d plugin -D insn_ekf_scalar.log \
+	    ./$(EKF_VER_ELF) "$(NOISY_CSV)" "$(EKF_REF_CSV)" 2>/dev/null || true
+	@tail -5 insn_ekf_scalar.log
+
+insn_ekf_vec: $(EKF_VEC_VER_ELF)
+	@echo "=== Counting instructions: EKF-M4 (vector) ==="
+	$(QEMU_V) -plugin $(QEMU_PLUGIN) -d plugin -D insn_ekf_vec.log \
+	    ./$(EKF_VEC_VER_ELF) "$(NOISY_CSV)" "$(EKF_REF_CSV)" 2>/dev/null || true
+	@tail -5 insn_ekf_vec.log
+
+insn_count: insn_lkf_scalar insn_lkf_vec insn_ekf_scalar insn_ekf_vec
+	@echo ""
+	@echo "=== Instruction Count Summary ==="
+	@echo "LKF scalar:"; grep -i 'total' insn_lkf_scalar.log 2>/dev/null || echo "  (check insn_lkf_scalar.log)"
+	@echo "LKF vector:"; grep -i 'total' insn_lkf_vec.log 2>/dev/null || echo "  (check insn_lkf_vec.log)"
+	@echo "EKF scalar:"; grep -i 'total' insn_ekf_scalar.log 2>/dev/null || echo "  (check insn_ekf_scalar.log)"
+	@echo "EKF vector:"; grep -i 'total' insn_ekf_vec.log 2>/dev/null || echo "  (check insn_ekf_vec.log)"
 
 # ─────────────────────────────────────────────
 # Cleanup
@@ -303,6 +376,8 @@ clean:
 	      $(EKF_VER_ELF) \
 	      $(LKF_VEC_VER_ELF) \
 	      $(EKF_VEC_VER_ELF) \
+	      $(PERF_ELF) \
+	      $(VERIFY_MAT_VEC_ELF) \
 	      $(LKF_ASM_CSV) \
 	      lkf_asm_verification.csv \
 	      $(EKF_ASM_CSV) \
@@ -311,5 +386,7 @@ clean:
 	      lkf_vec_verification.csv \
 	      ekf_vec_results.csv \
 	      ekf_vec_verification.csv \
-	      insn.log
+	      perf_analysis.csv \
+	      insn.log insn_lkf_scalar.log insn_lkf_vec.log \
+	      insn_ekf_scalar.log insn_ekf_vec.log
 	rm -rf plots/

@@ -1,0 +1,117 @@
+This is pdfTeX, Version 3.141592653-2.6-1.40.25 (MiKTeX 24.1) (preloaded format=pdflatex 2026.5.16)  16 MAY 2026 19:07
+entering extended mode
+ restricted \write18 enabled.
+ %&-line parsing enabled.
+**./milestone4_report.tex
+(milestone4_report.tex
+LaTeX2e <2023-11-01> patch level 1
+L3 programming layer <2024-01-04>
+
+(C:\Users\usman_pyywgw5\AppData\Local\Programs\MiKTeX\tex/latex/base\article.cl
+s
+Document Class: article 2023/05/17 v1.4n Standard LaTeX document class
+
+(C:\Users\usman_pyywgw5\AppData\Local\Programs\MiKTeX\tex/latex/base\size10.clo
+File: size10.clo 2023/05/17 v1.4n Standard LaTeX file (size option)
+)
+\c@part=\count187
+\c@section=\count188
+\c@subsection=\count189
+\c@subsubsection=\count190
+\c@paragraph=\count191
+\c@subparagraph=\count192
+\c@figure=\count193
+\c@table=\count194
+\abovecaptionskip=\skip48
+\belowcaptionskip=\skip49
+\bibindent=\dimen140
+)
+(C:\Users\usman_pyywgw5\AppData\Local\Programs\MiKTeX\tex/latex/base\inputenc.s
+ty
+Package: inputenc 2021/02/14 v1.3d Input encoding file
+\inpenc@prehook=\toks17
+\inpenc@posthook=\toks18
+)
+(C:\Users\usman_pyywgw5\AppData\Local\Programs\MiKTeX\tex/latex/l3backend\l3bac
+kend-pdftex.def
+File: l3backend-pdftex.def 2024-01-04 L3 backend support: PDF output (pdfTeX)
+\l__color_backend_stack_int=\count195
+\l__pdf_internal_box=\box51
+)
+No file milestone4_report.aux.
+\openout1 = `milestone4_report.aux'.
+
+LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 7.
+LaTeX Font Info:    ... okay on input line 7.
+LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 7.
+LaTeX Font Info:    ... okay on input line 7.
+LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 7.
+LaTeX Font Info:    ... okay on input line 7.
+LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 7.
+LaTeX Font Info:    ... okay on input line 7.
+LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 7.
+LaTeX Font Info:    ... okay on input line 7.
+LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 7.
+LaTeX Font Info:    ... okay on input line 7.
+LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 7.
+LaTeX Font Info:    ... okay on input line 7.
+LaTeX Font Info:    External font `cmex10' loaded for size
+(Font)              <12> on input line 8.
+LaTeX Font Info:    External font `cmex10' loaded for size
+(Font)              <8> on input line 8.
+LaTeX Font Info:    External font `cmex10' loaded for size
+(Font)              <6> on input line 8.
+LaTeX Font Info:    Font shape `OT1/cmtt/bx/n' in size <12> not available
+(Font)              Font shape `OT1/cmtt/m/n' tried instead on input line 16.
+LaTeX Font Info:    External font `cmex10' loaded for size
+(Font)              <7> on input line 17.
+LaTeX Font Info:    External font `cmex10' loaded for size
+(Font)              <5> on input line 17.
+
+Overfull \hbox (1.49698pt too wide) in paragraph at lines 23--23
+[]\OT1/cmtt/m/n/10 vfmacc.vf v0, ft0, v4            # v0 += A[i][k] * B[k][j..j
++VL-1][] 
+ []
+
+[1
+
+{C:/Users/usman_pyywgw5/AppData/Local/MiKTeX/fonts/map/pdftex/pdftex.map}]
+[2]
+Overfull \hbox (22.08397pt too wide) in paragraph at lines 159--167
+ [][] 
+ []
+
+[3] [4] (milestone4_report.aux)
+ ***********
+LaTeX2e <2023-11-01> patch level 1
+L3 programming layer <2024-01-04>
+ ***********
+ ) 
+Here is how much of TeX's memory you used:
+ 505 strings out of 474485
+ 9983 string characters out of 5739958
+ 1943542 words of memory out of 5000000
+ 22859 multiletter control sequences out of 15000+600000
+ 562688 words of font info for 52 fonts, out of 8000000 for 9000
+ 1141 hyphenation exceptions out of 8191
+ 35i,8n,50p,388b,204s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ <C:\Users\usman_pyywgw5\AppData\Local\MiKTeX\fonts/pk/ljfour/jknappen/ec/dpi
+600\tcrm1000.pk><C:/Users/usman_pyywgw5/AppData/Local/Programs/MiKTeX/fonts/typ
+e1/public/amsfonts/cm/cmbx12.pfb><C:/Users/usman_pyywgw5/AppData/Local/Programs
+/MiKTeX/fonts/type1/public/amsfonts/cm/cmmi10.pfb><C:/Users/usman_pyywgw5/AppDa
+ta/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmr10.pfb><C:/Users/usm
+an_pyywgw5/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmr12.p
+fb><C:/Users/usman_pyywgw5/AppData/Local/Programs/MiKTeX/fonts/type1/public/ams
+fonts/cm/cmr17.pfb><C:/Users/usman_pyywgw5/AppData/Local/Programs/MiKTeX/fonts/
+type1/public/amsfonts/cm/cmr7.pfb><C:/Users/usman_pyywgw5/AppData/Local/Program
+s/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy10.pfb><C:/Users/usman_pyywgw5/AppD
+ata/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy7.pfb><C:/Users/us
+man_pyywgw5/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmtt10
+.pfb><C:/Users/usman_pyywgw5/AppData/Local/Programs/MiKTeX/fonts/type1/public/a
+msfonts/cm/cmtt12.pfb>
+Output written on milestone4_report.pdf (4 pages, 134838 bytes).
+PDF statistics:
+ 70 PDF objects out of 1000 (max. 8388607)
+ 0 named destinations out of 1000 (max. 500000)
+ 1 words of extra memory for PDF output out of 10000 (max. 10000000)
+
