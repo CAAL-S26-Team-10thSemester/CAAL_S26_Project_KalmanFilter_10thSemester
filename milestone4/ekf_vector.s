@@ -107,8 +107,8 @@
     .extern mat_inverse_nxn
     .extern fast_atan2
     .extern wrap_angle
-    .extern state_init_F
-    .extern state_init_Q
+    .extern state_vec_init_F
+    .extern state_vec_init_Q
 
 # =============================================================================
 #  .rodata — constants (names unique to EKF, prefix ekf_)
@@ -283,13 +283,13 @@ ekf_vec_init:
     la      t0, ekf_OFF_P; ld t0, 0(t0); add a0, s0, t0
     li      a1, 276; call mat_eye
 
-    # F = state_init_F(dt)
+    # F = state_vec_init_F(dt)
     la      t0, ekf_OFF_F; ld t0, 0(t0); add a0, s0, t0
-    fmv.d   fa0, fs0; call state_init_F
+    fmv.d   fa0, fs0; call state_vec_init_F
 
-    # Q = state_init_Q()
+    # Q = state_vec_init_Q()
     la      t0, ekf_OFF_Q; ld t0, 0(t0); add a0, s0, t0
-    call    state_init_Q
+    call    state_vec_init_Q
 
     # R = ekf_vec_init_R()
     la      t0, ekf_OFF_R; ld t0, 0(t0); add a0, s0, t0
